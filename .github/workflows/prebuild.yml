@@ -44,7 +44,8 @@ jobs:
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./...
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
-            -trimpath -ldflags='-s -w -buildid=' -o dist/linux-x64/fingertipd .
+            -buildvcs=false -trimpath -ldflags='-s -w -buildid=' \
+            -o dist/linux-x64/fingertipd .
       - name: Build pinned hnsd
         run: |
           git clone --filter=blob:none --no-checkout https://github.com/handshake-org/hnsd.git /tmp/hnsd

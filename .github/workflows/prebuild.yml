@@ -3,7 +3,7 @@ name: Linux x64 prebuild
 on:
   workflow_dispatch:
     inputs:
-      release-tag:
+      release_tag:
         description: Release tag to create or update
         default: v0.1.0
         required: true
@@ -39,7 +39,7 @@ jobs:
         with:
           fetch-depth: 0
       - name: Verify release source
-        run: test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 '${{ inputs.release-tag }}')"
+        run: test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 '${{ inputs.release_tag }}')"
       - name: Build fingertipd
         run: |
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./...
@@ -64,21 +64,21 @@ jobs:
           cp "$(go env GOMODCACHE)/github.com/buffrr/letsdane@v0.6.1/LICENSE" \
             dist/licenses/letsdane-Apache-2.0.txt
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-            -C dist -czf "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" \
+            -C dist -czf "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" \
             linux-x64 licenses
-          sha256sum "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" > SHA256SUMS
+          sha256sum "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fingertipd-${{ inputs.release-tag }}-linux-x64
+          name: fingertipd-${{ inputs.release_tag }}-linux-x64
           path: |
-            fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz
+            fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz
             SHA256SUMS
           if-no-files-found: error
       - name: Attach artifacts to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view '${{ inputs.release-tag }}' >/dev/null 2>&1 || \
-            gh release create '${{ inputs.release-tag }}' --verify-tag --title '${{ inputs.release-tag }}'
-          gh release upload '${{ inputs.release-tag }}' \
-            "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" SHA256SUMS --clobber
+          gh release view '${{ inputs.release_tag }}' >/dev/null 2>&1 || \
+            gh release create '${{ inputs.release_tag }}' --verify-tag --title '${{ inputs.release_tag }}'
+          gh release upload '${{ inputs.release_tag }}' \
+            "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" SHA256SUMS --clobber

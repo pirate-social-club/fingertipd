@@ -242,6 +242,7 @@ func querySync(rootAddr, recursiveAddr string) (uint32, bool) {
 func queryHeight(client *dns.Client, addr string) uint32 {
 	msg := new(dns.Msg)
 	msg.SetQuestion("height.tip.chain.hnsd.", dns.TypeTXT)
+	msg.Question[0].Qclass = dns.ClassHESIOD
 	response, _, err := client.Exchange(msg, addr)
 	if err != nil || response == nil {
 		return 0

@@ -23,6 +23,9 @@ func TestParseConfig(t *testing.T) {
 
 func TestQuerySyncUsesRootForHeightAndRecursiveForReadiness(t *testing.T) {
 	rootAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		if request.Question[0].Qclass != dns.ClassHESIOD {
+			t.Errorf("height query class = %d, want HESIOD", request.Question[0].Qclass)
+		}
 		response := new(dns.Msg)
 		response.SetReply(request)
 		response.Answer = []dns.RR{&dns.TXT{

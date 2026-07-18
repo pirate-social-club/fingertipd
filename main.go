@@ -30,7 +30,7 @@ import (
 const (
 	caFileName       = "ca.pem"
 	caKeyFileName    = "ca-key.pem"
-	readinessName    = "app.pirate."
+	readinessName    = "_443._tcp.app.pirate."
 	shutdownDeadline = 4 * time.Second
 	pollInterval     = 2 * time.Second
 	dnsStartDeadline = 20 * time.Second
@@ -246,9 +246,18 @@ func querySync(rootAddr, recursiveAddr string) (uint32, bool) {
 	client := &dns.Client{Timeout: time.Second}
 	height := queryHeight(client, rootAddr)
 	msg := new(dns.Msg)
-	msg.SetQuestion(readinessName, dns.TypeA)
+	msg.SetQuestion(readinessName, dns.TypeTLSA)
+	msg.SetEdns0(1232, true)
 	response, _, err := client.Exchange(msg, recursiveAddr)
-	return height, err == nil && response != nil && response.Rcode == dns.RcodeSuccess && len(response.Answer) > 0
+	if err != nil || response == nil || response.Rcode != dns.RcodeSuccess || !response.AuthenticatedData {
+		return height, false
+	}
+	for _, answer := range response.Answer {
+		if answer.Header().Rrtype == dns.TypeTLSA {
+			return height, true
+		}
+	}
+	return height, false
 }
 
 func queryHeight(client *dns.Client, addr string) uint32 {

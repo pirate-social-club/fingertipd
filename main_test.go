@@ -35,17 +35,44 @@ func TestQuerySyncUsesRootForHeightAndRecursiveForReadiness(t *testing.T) {
 		_ = w.WriteMsg(response)
 	}))
 	recursiveAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		if request.Question[0].Name != readinessName || request.Question[0].Qtype != dns.TypeTLSA {
+			t.Errorf("readiness query = %s/%d, want %s/TLSA", request.Question[0].Name, request.Question[0].Qtype, readinessName)
+		}
 		response := new(dns.Msg)
 		response.SetReply(request)
-		response.Answer = []dns.RR{&dns.A{
-			Hdr: dns.RR_Header{Name: readinessName, Rrtype: dns.TypeA, Class: dns.ClassINET},
-			A:   net.ParseIP("127.0.0.1"),
+		response.AuthenticatedData = true
+		response.Answer = []dns.RR{&dns.TLSA{
+			Hdr:          dns.RR_Header{Name: readinessName, Rrtype: dns.TypeTLSA, Class: dns.ClassINET},
+			Usage:        3,
+			Selector:     1,
+			MatchingType: 1,
+			Certificate:  "00",
 		}}
 		_ = w.WriteMsg(response)
 	}))
 	height, synced := querySync(rootAddr, recursiveAddr)
 	if height != 123456 || !synced {
 		t.Fatalf("querySync returned height=%d synced=%v", height, synced)
+	}
+}
+
+func TestQuerySyncRejectsUnauthenticatedTLSA(t *testing.T) {
+	rootAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		_ = w.WriteMsg(response)
+	}))
+	recursiveAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.TLSA{
+			Hdr: dns.RR_Header{Name: readinessName, Rrtype: dns.TypeTLSA, Class: dns.ClassINET},
+		}}
+		_ = w.WriteMsg(response)
+	}))
+	_, synced := querySync(rootAddr, recursiveAddr)
+	if synced {
+		t.Fatal("unauthenticated TLSA must not report synced")
 	}
 }
 

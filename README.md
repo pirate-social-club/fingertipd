@@ -19,6 +19,10 @@ The daemon requires `-data-dir` and `-hnsd-path`. DNS listeners default to
 `127.0.0.1:15349` and `127.0.0.1:15350`, and every listener is required to be
 loopback-only.
 
+Hermetic tests may pass `-hnsd-seed 127.0.0.1:<port>` to connect the spawned
+compile-time-regtest hnsd to their local hsd fixture. The flag is optional,
+accepts loopback addresses only, and is omitted by every production launch.
+
 ## Pinned dependencies
 
 - `buffrr/letsdane` v0.6.1

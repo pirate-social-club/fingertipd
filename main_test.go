@@ -68,6 +68,20 @@ func TestParseConfigRejectsNonLoopback(t *testing.T) {
 	}
 }
 
+func TestParseConfigAcceptsOnlyLoopbackHnsdSeed(t *testing.T) {
+	cfg, err := parseConfig([]string{"-data-dir", "/tmp/data", "-hnsd-path", "/bin/hnsd", "-hnsd-seed", "127.0.0.1:10000"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.hnsdSeed != "127.0.0.1:10000" {
+		t.Fatalf("unexpected seed: %q", cfg.hnsdSeed)
+	}
+	_, err = parseConfig([]string{"-data-dir", "/tmp/data", "-hnsd-path", "/bin/hnsd", "-hnsd-seed", "8.8.8.8:53"})
+	if err == nil {
+		t.Fatal("expected non-loopback seed to be rejected")
+	}
+}
+
 func TestLoadOrCreateCAPersistsPrivatePair(t *testing.T) {
 	dir := t.TempDir()
 	cert, key, path, err := loadOrCreateCA(dir)

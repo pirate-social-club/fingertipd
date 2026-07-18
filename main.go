@@ -41,6 +41,7 @@ type config struct {
 	hnsdPath      string
 	rootAddr      string
 	recursiveAddr string
+	hnsdSeed      string
 }
 
 type eventWriter struct {
@@ -64,6 +65,7 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.hnsdPath, "hnsd-path", "", "path to hnsd")
 	fs.StringVar(&cfg.rootAddr, "root-addr", "127.0.0.1:15349", "hnsd authoritative DNS listen address")
 	fs.StringVar(&cfg.recursiveAddr, "recursive-addr", "127.0.0.1:15350", "hnsd recursive DNS listen address")
+	fs.StringVar(&cfg.hnsdSeed, "hnsd-seed", "", "optional loopback hnsd peer for hermetic tests")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
 	}
@@ -77,6 +79,12 @@ func parseConfig(args []string) (config, error) {
 		host, _, err := net.SplitHostPort(addr)
 		if err != nil || !net.ParseIP(host).IsLoopback() {
 			return config{}, fmt.Errorf("%s address must be a loopback IP and port: %q", name, addr)
+		}
+	}
+	if cfg.hnsdSeed != "" {
+		host, _, err := net.SplitHostPort(cfg.hnsdSeed)
+		if err != nil || !net.ParseIP(host).IsLoopback() {
+			return config{}, fmt.Errorf("hnsd seed must be a loopback IP and port: %q", cfg.hnsdSeed)
 		}
 	}
 	return cfg, nil
@@ -110,7 +118,11 @@ func run(cfg config, stdout *os.File) error {
 		return err
 	}
 
-	child := exec.Command(cfg.hnsdPath, "-n", cfg.rootAddr, "-r", cfg.recursiveAddr, "-x", prefix, "-t")
+	hnsdArgs := []string{"-n", cfg.rootAddr, "-r", cfg.recursiveAddr, "-x", prefix, "-t"}
+	if cfg.hnsdSeed != "" {
+		hnsdArgs = append([]string{"-s", cfg.hnsdSeed}, hnsdArgs...)
+	}
+	child := exec.Command(cfg.hnsdPath, hnsdArgs...)
 	child.Stdout = os.Stderr
 	child.Stderr = os.Stderr
 	child.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}

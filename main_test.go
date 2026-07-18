@@ -3,9 +3,12 @@ package main
 import (
 	"crypto/rsa"
 	"crypto/x509"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/miekg/dns"
 )
 
 func TestParseConfig(t *testing.T) {
@@ -16,6 +19,43 @@ func TestParseConfig(t *testing.T) {
 	if cfg.dataDir != "/tmp/data" || cfg.hnsdPath != "/bin/hnsd" {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
+}
+
+func TestQuerySyncUsesRootForHeightAndRecursiveForReadiness(t *testing.T) {
+	rootAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.TXT{
+			Hdr: dns.RR_Header{Name: "height.tip.chain.hnsd.", Rrtype: dns.TypeTXT, Class: dns.ClassINET},
+			Txt: []string{"123456"},
+		}}
+		_ = w.WriteMsg(response)
+	}))
+	recursiveAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
+		response := new(dns.Msg)
+		response.SetReply(request)
+		response.Answer = []dns.RR{&dns.A{
+			Hdr: dns.RR_Header{Name: readinessName, Rrtype: dns.TypeA, Class: dns.ClassINET},
+			A:   net.ParseIP("127.0.0.1"),
+		}}
+		_ = w.WriteMsg(response)
+	}))
+	height, synced := querySync(rootAddr, recursiveAddr)
+	if height != 123456 || !synced {
+		t.Fatalf("querySync returned height=%d synced=%v", height, synced)
+	}
+}
+
+func startDNSTestServer(t *testing.T, handler dns.Handler) string {
+	t.Helper()
+	connection, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := &dns.Server{PacketConn: connection, Handler: handler}
+	go func() { _ = server.ActivateAndServe() }()
+	t.Cleanup(func() { _ = server.Shutdown() })
+	return connection.LocalAddr().String()
 }
 
 func TestParseConfigRejectsNonLoopback(t *testing.T) {

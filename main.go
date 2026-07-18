@@ -151,7 +151,7 @@ func run(cfg config, stdout *os.File) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	go reportSync(ctx, cfg.recursiveAddr, events)
+	go reportSync(ctx, cfg.rootAddr, cfg.recursiveAddr, events)
 
 	select {
 	case <-ctx.Done():
@@ -211,12 +211,12 @@ func stopChild(child *exec.Cmd, done <-chan error) {
 	}
 }
 
-func reportSync(ctx context.Context, addr string, events *eventWriter) {
+func reportSync(ctx context.Context, rootAddr, recursiveAddr string, events *eventWriter) {
 	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 	last := ""
 	for {
-		height, synced := querySync(addr)
+		height, synced := querySync(rootAddr, recursiveAddr)
 		key := strconv.FormatUint(uint64(height), 10) + ":" + strconv.FormatBool(synced)
 		if key != last {
 			events.emit(map[string]any{"type": "sync", "height": height, "synced": synced})
@@ -230,12 +230,12 @@ func reportSync(ctx context.Context, addr string, events *eventWriter) {
 	}
 }
 
-func querySync(addr string) (uint32, bool) {
+func querySync(rootAddr, recursiveAddr string) (uint32, bool) {
 	client := &dns.Client{Timeout: time.Second}
-	height := queryHeight(client, addr)
+	height := queryHeight(client, rootAddr)
 	msg := new(dns.Msg)
 	msg.SetQuestion(readinessName, dns.TypeA)
-	response, _, err := client.Exchange(msg, addr)
+	response, _, err := client.Exchange(msg, recursiveAddr)
 	return height, err == nil && response != nil && response.Rcode == dns.RcodeSuccess && len(response.Answer) > 0
 }
 

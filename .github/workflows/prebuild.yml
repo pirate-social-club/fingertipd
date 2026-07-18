@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     # A dated Debian image keeps the C toolchain stable and reviewable. Update
     # this pin deliberately alongside a successful compatibility run.
-    container: debian:trixie-20250630-slim
+    container: debian:trixie-20250630-slim@sha256:88ef4df0f82963ff3c0472493da188f082822b2a16b1be23d238d124d5c8c92e
     steps:
       - name: Install build prerequisites
         run: |
@@ -54,28 +54,29 @@ jobs:
           test "$(git -C /tmp/hnsd describe --tags --exact-match)" = "$HNSD_VERSION"
           cd /tmp/hnsd
           ./autogen.sh
-          UNBOUND_STATIC_LIBS="$(pkg-config --static --libs libunbound)"
-          ./configure --disable-shared --enable-static LDFLAGS=-static \
-            LIBS="$UNBOUND_STATIC_LIBS"
+          ./configure --disable-shared --enable-static
           make -j2
           cp hnsd "$GITHUB_WORKSPACE/dist/linux-x64/hnsd"
       - name: Package and checksum
         run: |
           chmod 0755 dist/linux-x64/fingertipd dist/linux-x64/hnsd
-          mkdir -p dist/licenses
-          cp LICENSE dist/licenses/fingertipd-MIT.txt
-          cp /tmp/hnsd/LICENSE dist/licenses/hnsd-MIT.txt
+          mkdir -p package/licenses
+          cp dist/linux-x64/fingertipd dist/linux-x64/hnsd package/
+          cp LICENSE package/licenses/fingertipd-MIT.txt
+          cp /tmp/hnsd/LICENSE package/licenses/hnsd-MIT.txt
           cp "$(go env GOMODCACHE)/github.com/buffrr/letsdane@v0.6.1/LICENSE" \
-            dist/licenses/letsdane-Apache-2.0.txt
+            package/licenses/letsdane-Apache-2.0.txt
+          cd package
+          sha256sum fingertipd hnsd > "$GITHUB_WORKSPACE/SHA256SUMS"
+          cd "$GITHUB_WORKSPACE"
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
-            -C dist -czf "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" \
-            linux-x64 licenses
-          sha256sum "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" > SHA256SUMS
+            -C package -czf freedom-hns-linux-x64.tar.gz .
+          sha256sum freedom-hns-linux-x64.tar.gz >> SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: fingertipd-${{ inputs.release_tag }}-linux-x64
+          name: freedom-hns-${{ inputs.release_tag }}-linux-x64
           path: |
-            fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz
+            freedom-hns-linux-x64.tar.gz
             SHA256SUMS
           if-no-files-found: error
       - name: Attach artifacts to GitHub release
@@ -85,4 +86,4 @@ jobs:
           gh release view '${{ inputs.release_tag }}' >/dev/null 2>&1 || \
             gh release create '${{ inputs.release_tag }}' --verify-tag --title '${{ inputs.release_tag }}'
           gh release upload '${{ inputs.release_tag }}' \
-            "fingertipd-${{ inputs.release_tag }}-linux-x64.tar.gz" SHA256SUMS --clobber
+            freedom-hns-linux-x64.tar.gz SHA256SUMS --clobber

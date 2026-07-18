@@ -54,7 +54,9 @@ jobs:
           test "$(git -C /tmp/hnsd describe --tags --exact-match)" = "$HNSD_VERSION"
           cd /tmp/hnsd
           ./autogen.sh
-          ./configure --disable-shared --enable-static LDFLAGS=-static
+          UNBOUND_STATIC_LIBS="$(pkg-config --static --libs libunbound)"
+          ./configure --disable-shared --enable-static LDFLAGS=-static \
+            LIBS="$UNBOUND_STATIC_LIBS"
           make -j2
           cp hnsd "$GITHUB_WORKSPACE/dist/linux-x64/hnsd"
       - name: Package and checksum

@@ -82,6 +82,7 @@ jobs:
       - name: Attach artifacts to GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release view '${{ inputs.release_tag }}' >/dev/null 2>&1 || \
             gh release create '${{ inputs.release_tag }}' --verify-tag --title '${{ inputs.release_tag }}'

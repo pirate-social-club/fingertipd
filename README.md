@@ -24,7 +24,12 @@ loopback-only.
 - `buffrr/letsdane` v0.6.1
 - `handshake-org/hnsd` v2.0.0 (release workflow input)
 
-The release workflow produces Linux x64 artifacts and a SHA-256 manifest.
+The release workflow produces the Linux x64 production archive and its
+`SHA256SUMS` trust manifest. It also produces a separately named, test-only
+`hnsd-regtest-linux-x64.tar.gz` archive with an independent
+`TEST_SHA256SUMS` manifest. The regtest binary is compiled from the same pinned
+hnsd commit with `--with-network=regtest`; it is a hermetic-test fixture and is
+never part of the production browser fetch allowlist.
 
 The daemon is MIT-licensed. Its pinned letsdane dependency is Apache-2.0 and
 the separately packaged hnsd binary is MIT-licensed; release archives retain

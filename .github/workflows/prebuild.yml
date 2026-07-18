@@ -57,6 +57,17 @@ jobs:
           ./configure --disable-shared --enable-static
           make -j2
           cp hnsd "$GITHUB_WORKSPACE/dist/linux-x64/hnsd"
+      - name: Build test-only regtest hnsd
+        run: |
+          git clone --no-hardlinks /tmp/hnsd /tmp/hnsd-regtest
+          cd /tmp/hnsd-regtest
+          git reset --hard "$HNSD_COMMIT"
+          test "$(git rev-parse HEAD)" = "$HNSD_COMMIT"
+          ./autogen.sh
+          ./configure --disable-shared --enable-static --with-network=regtest
+          make -j2
+          mkdir -p "$GITHUB_WORKSPACE/dist/test-linux-x64"
+          cp hnsd "$GITHUB_WORKSPACE/dist/test-linux-x64/hnsd-regtest"
       - name: Package and checksum
         run: |
           chmod 0755 dist/linux-x64/fingertipd dist/linux-x64/hnsd
@@ -72,12 +83,24 @@ jobs:
           tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
             -C package -czf freedom-hns-linux-x64.tar.gz .
           sha256sum freedom-hns-linux-x64.tar.gz >> SHA256SUMS
+      - name: Package test-only regtest binary
+        run: |
+          chmod 0755 dist/test-linux-x64/hnsd-regtest
+          mkdir -p test-package
+          cp dist/test-linux-x64/hnsd-regtest test-package/
+          sha256sum dist/test-linux-x64/hnsd-regtest | sed 's#dist/test-linux-x64/##' \
+            > TEST_SHA256SUMS
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -C test-package -czf hnsd-regtest-linux-x64.tar.gz .
+          sha256sum hnsd-regtest-linux-x64.tar.gz >> TEST_SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: freedom-hns-${{ inputs.release_tag }}-linux-x64
           path: |
             freedom-hns-linux-x64.tar.gz
             SHA256SUMS
+            hnsd-regtest-linux-x64.tar.gz
+            TEST_SHA256SUMS
           if-no-files-found: error
       - name: Attach artifacts to GitHub release
         env:
@@ -87,4 +110,5 @@ jobs:
           gh release view '${{ inputs.release_tag }}' >/dev/null 2>&1 || \
             gh release create '${{ inputs.release_tag }}' --verify-tag --title '${{ inputs.release_tag }}'
           gh release upload '${{ inputs.release_tag }}' \
-            freedom-hns-linux-x64.tar.gz SHA256SUMS --clobber
+            freedom-hns-linux-x64.tar.gz SHA256SUMS \
+            hnsd-regtest-linux-x64.tar.gz TEST_SHA256SUMS --clobber

@@ -1,0 +1,84 @@
+name: Linux x64 prebuild
+
+on:
+  workflow_dispatch:
+    inputs:
+      release-tag:
+        description: Release tag to create or update
+        default: v0.1.0
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  GO_VERSION: 1.24.6
+  HNSD_VERSION: v2.0.0
+  HNSD_COMMIT: a5c7c287e848f46d3e97f16b698e2027c8dc96c3
+
+jobs:
+  linux-x64:
+    runs-on: ubuntu-24.04
+    # A dated Debian image keeps the C toolchain stable and reviewable. Update
+    # this pin deliberately alongside a successful compatibility run.
+    container: debian:trixie-20250630-slim
+    steps:
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            autoconf automake build-essential ca-certificates curl gh git libtool pkg-config
+      - name: Install Go
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+          echo "bbca37cc395c974ffa4893ee35819ad23ebb27426df87af92e93a9ec66ef8712  /tmp/go.tar.gz" | sha256sum -c -
+          tar -C /usr/local -xzf /tmp/go.tar.gz
+          echo /usr/local/go/bin >> "$GITHUB_PATH"
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+      - name: Verify release source
+        run: test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 '${{ inputs.release-tag }}')"
+      - name: Build fingertipd
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go test ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -trimpath -ldflags='-s -w -buildid=' -o dist/linux-x64/fingertipd .
+      - name: Build pinned hnsd
+        run: |
+          git clone --filter=blob:none --no-checkout https://github.com/handshake-org/hnsd.git /tmp/hnsd
+          git -C /tmp/hnsd checkout --detach "$HNSD_COMMIT"
+          test "$(git -C /tmp/hnsd describe --tags --exact-match)" = "$HNSD_VERSION"
+          cd /tmp/hnsd
+          ./autogen.sh
+          ./configure --disable-shared --enable-static
+          make -j2
+          cp hnsd "$GITHUB_WORKSPACE/dist/linux-x64/hnsd"
+      - name: Package and checksum
+        run: |
+          chmod 0755 dist/linux-x64/fingertipd dist/linux-x64/hnsd
+          mkdir -p dist/licenses
+          cp LICENSE dist/licenses/fingertipd-MIT.txt
+          cp /tmp/hnsd/LICENSE dist/licenses/hnsd-MIT.txt
+          cp "$(go env GOMODCACHE)/github.com/buffrr/letsdane@v0.6.1/LICENSE" \
+            dist/licenses/letsdane-Apache-2.0.txt
+          tar --sort=name --mtime='UTC 1970-01-01' --owner=0 --group=0 --numeric-owner \
+            -C dist -czf "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" \
+            linux-x64 licenses
+          sha256sum "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" > SHA256SUMS
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: fingertipd-${{ inputs.release-tag }}-linux-x64
+          path: |
+            fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz
+            SHA256SUMS
+          if-no-files-found: error
+      - name: Attach artifacts to GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view '${{ inputs.release-tag }}' >/dev/null 2>&1 || \
+            gh release create '${{ inputs.release-tag }}' --verify-tag --title '${{ inputs.release-tag }}'
+          gh release upload '${{ inputs.release-tag }}' \
+            "fingertipd-${{ inputs.release-tag }}-linux-x64.tar.gz" SHA256SUMS --clobber

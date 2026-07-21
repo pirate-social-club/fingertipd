@@ -6,6 +6,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/miekg/dns"
@@ -184,6 +185,32 @@ func TestDoHFallbackIsOffByDefault(t *testing.T) {
 	}
 	if cfg.dohEndpoint != "" {
 		t.Fatalf("DoH fallback defaulted to %q; it must be opt-in", cfg.dohEndpoint)
+	}
+}
+
+func TestImplicitDoHDefaultRequiresDelegatedZoneCapability(t *testing.T) {
+	_, err := parseConfigWithDOHDefault(
+		[]string{"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true"},
+		"https://dns.pirate.sc/dns-query",
+	)
+	if err == nil || !strings.Contains(err.Error(), "requires delegated-zone validation") {
+		t.Fatalf("implicit fallback was accepted without delegated-zone support: %v", err)
+	}
+}
+
+func TestExplicitDoHFallbackRemainsAvailableForControlledTesting(t *testing.T) {
+	cfg, err := parseConfigWithDOHDefault(
+		[]string{
+			"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true",
+			"-doh-fallback-endpoint", "https://test-resolver.example/dns-query",
+		},
+		"https://dns.pirate.sc/dns-query",
+	)
+	if err != nil {
+		t.Fatalf("explicit controlled fallback rejected: %v", err)
+	}
+	if cfg.dohEndpoint != "https://test-resolver.example/dns-query" {
+		t.Fatalf("explicit endpoint not retained: %q", cfg.dohEndpoint)
 	}
 }
 

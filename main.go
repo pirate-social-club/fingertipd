@@ -63,7 +63,13 @@ func (w *eventWriter) emit(v any) {
 	}
 }
 
+const defaultDOHFallbackEndpoint = ""
+
 func parseConfig(args []string) (config, error) {
+	return parseConfigWithDOHDefault(args, defaultDOHFallbackEndpoint)
+}
+
+func parseConfigWithDOHDefault(args []string, defaultDOHEndpoint string) (config, error) {
 	fs := flag.NewFlagSet("fingertipd", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	var cfg config
@@ -77,10 +83,19 @@ func parseConfig(args []string) (config, error) {
 	// Answers from it are validated locally against the chain's DS anchor, so
 	// the endpoint is untrusted encrypted transport, not an authority. This is
 	// NOT full DNSSEC validation: see internal/vdoh for the exact scope.
-	fs.StringVar(&cfg.dohEndpoint, "doh-fallback-endpoint", "",
+	fs.StringVar(&cfg.dohEndpoint, "doh-fallback-endpoint", defaultDOHEndpoint,
 		"optional https DoH URL (including its query path) used only when the local node cannot answer")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
+	}
+	explicitDOH := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "doh-fallback-endpoint" {
+			explicitDOH = true
+		}
+	})
+	if cfg.dohEndpoint != "" && !explicitDOH && !vdoh.SupportsDelegatedZones() {
+		return config{}, errors.New("implicit DoH fallback requires delegated-zone validation; use explicit -doh-fallback-endpoint only for controlled top-level testing")
 	}
 	// Reject a malformed endpoint here rather than after hnsd has been started:
 	// a configuration error should not cost a subsystem launch to discover.

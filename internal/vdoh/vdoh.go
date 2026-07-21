@@ -360,6 +360,17 @@ func (r *Resolver) verifySigs(records []dns.RR, sigs []*dns.RRSIG, zone string, 
 			lastErr = fmt.Errorf("signer %q is not the anchored zone %q", sig.SignerName, zone)
 			continue
 		}
+		// A signature whose label count is below the owner's means the answer was
+		// synthesized from a wildcard. The signature is genuine, but proving the
+		// wildcard legitimately applies requires authenticated denial that no
+		// closer name exists -- which needs NSEC/NSEC3 and is not implemented.
+		// Without it an endpoint could serve a wildcard-expanded answer in place
+		// of a name that has its own, more specific record. Both are signed by
+		// the zone, so only the denial proof distinguishes them.
+		if owner := records[0].Header().Name; int(sig.Labels) < dns.CountLabel(owner) {
+			lastErr = fmt.Errorf("answer for %s is wildcard-expanded, which cannot be proven without NSEC", owner)
+			continue
+		}
 		if !sig.ValidityPeriod(now) {
 			lastErr = fmt.Errorf("signature by key %d is outside its validity period", sig.KeyTag)
 			continue
@@ -381,7 +392,15 @@ func (r *Resolver) verifySigs(records []dns.RR, sigs []*dns.RRSIG, zone string, 
 	return lastErr
 }
 
+// maxCNAMEDepth bounds an alias chain. A loop or an absurdly long chain from an
+// untrusted endpoint must terminate.
+const maxCNAMEDepth = 8
+
 // lookup fetches a type and returns it only if the chain proves it.
+//
+// CNAMEs are followed, but every step is validated before it is taken and the
+// chain may not leave the anchored zone: this package anchors at the top level
+// only, so a target in another zone is one it cannot prove anything about.
 func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns.RR, error) {
 	zone := zoneOf(name)
 
@@ -390,29 +409,67 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 		return nil, err
 	}
 
-	msg, err := r.exchange(ctx, name, qtype)
-	if err != nil {
-		return nil, err
-	}
-	switch msg.Rcode {
-	case dns.RcodeSuccess:
-	case dns.RcodeNameError:
-		// A negative answer needs NSEC/NSEC3 proof to be trustworthy. That is
-		// not implemented, so it is reported as unvalidatable rather than
-		// returned as a proven absence.
-		return nil, fmt.Errorf("%w: negative answer for %s is not proven (NSEC validation unimplemented)", ErrInsecure, name)
-	default:
-		return nil, fmt.Errorf("vdoh: lookup for %s failed with rcode %s", name, dns.RcodeToString[msg.Rcode])
-	}
+	current := dns.Fqdn(name)
+	followed := 0
+	for {
+		msg, err := r.exchange(ctx, current, qtype)
+		if err != nil {
+			return nil, err
+		}
+		switch msg.Rcode {
+		case dns.RcodeSuccess:
+		case dns.RcodeNameError:
+			// A negative answer needs NSEC/NSEC3 proof to be trustworthy. That is
+			// not implemented, so it is reported as unvalidatable rather than
+			// returned as a proven absence.
+			return nil, fmt.Errorf("%w: negative answer for %s is not proven (NSEC validation unimplemented)", ErrInsecure, current)
+		default:
+			return nil, fmt.Errorf("vdoh: lookup for %s failed with rcode %s", current, dns.RcodeToString[msg.Rcode])
+		}
 
-	records, sigs := rrset(msg, name, qtype)
-	if len(records) == 0 {
-		return nil, fmt.Errorf("%w: no records of the requested type for %s", ErrInsecure, name)
+		if records, sigs := rrset(msg, current, qtype); len(records) > 0 {
+			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
+				return nil, fmt.Errorf("%w: %s: %v", ErrInsecure, current, err)
+			}
+			return records, nil
+		}
+
+		aliases, aliasSigs := rrset(msg, current, dns.TypeCNAME)
+		if len(aliases) == 0 {
+			return nil, fmt.Errorf("%w: no records of the requested type for %s", ErrInsecure, current)
+		}
+		if len(aliases) > 1 {
+			// A name owns at most one CNAME. More than one means the endpoint is
+			// offering a choice, which is not a choice it gets to make.
+			return nil, fmt.Errorf("%w: %s returned %d CNAME records", ErrInsecure, current, len(aliases))
+		}
+		// Validate the alias before following it, or the endpoint could redirect
+		// the lookup with an unsigned record and have the target validate fine.
+		if err := r.verifySigs(aliases, aliasSigs, zone, keys); err != nil {
+			return nil, fmt.Errorf("%w: CNAME for %s: %v", ErrInsecure, current, err)
+		}
+
+		cname, ok := aliases[0].(*dns.CNAME)
+		if !ok {
+			return nil, fmt.Errorf("%w: malformed CNAME for %s", ErrInsecure, current)
+		}
+		target := dns.Fqdn(cname.Target)
+		if !strings.EqualFold(zoneOf(target), zone) {
+			return nil, fmt.Errorf("%w: CNAME for %s points to %s outside the anchored zone %s",
+				ErrInsecure, current, target, zone)
+		}
+		if strings.EqualFold(target, current) {
+			return nil, fmt.Errorf("%w: CNAME for %s points to itself", ErrInsecure, current)
+		}
+		// Enforced here, at the point of following, so the bound is exactly the
+		// number of aliases traversed. Checking at the top of the loop instead
+		// permits one more hop than the limit names.
+		if followed >= maxCNAMEDepth {
+			return nil, fmt.Errorf("%w: alias chain from %s exceeded %d steps", ErrInsecure, name, maxCNAMEDepth)
+		}
+		followed++
+		current = target
 	}
-	if err := r.verifySigs(records, sigs, zone, keys); err != nil {
-		return nil, fmt.Errorf("%w: %s: %v", ErrInsecure, name, err)
-	}
-	return records, nil
 }
 
 // LookupIP implements resolver.Resolver.

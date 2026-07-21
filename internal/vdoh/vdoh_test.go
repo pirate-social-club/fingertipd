@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -468,5 +469,212 @@ func TestNegativeAnswerIsNotReportedAsProven(t *testing.T) {
 	}
 	if !errors.Is(err, ErrInsecure) {
 		t.Fatalf("NXDOMAIN without NSEC proof must be reported as unvalidatable, got %v", err)
+	}
+}
+
+// --- CNAME ------------------------------------------------------------------
+
+func cname(name, target string) *dns.CNAME {
+	return &dns.CNAME{
+		Hdr:    dns.RR_Header{Name: dns.Fqdn(name), Rrtype: dns.TypeCNAME, Class: dns.ClassINET, Ttl: 300},
+		Target: dns.Fqdn(target),
+	}
+}
+
+// zoneServer answers from a signed fixture, so tests describe zone contents
+// rather than wire details.
+func signedZone(t *testing.T, z *zone, now time.Time, rrs ...dns.RR) handler {
+	t.Helper()
+	byName := map[string][]dns.RR{}
+	for _, rr := range rrs {
+		k := strings.ToLower(rr.Header().Name) + "/" + dns.TypeToString[rr.Header().Rrtype]
+		byName[k] = append(byName[k], rr)
+	}
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	return func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		var answers []dns.RR
+		if set, ok := byName[strings.ToLower(q.Name)+"/"+dns.TypeToString[q.Qtype]]; ok {
+			answers = append(answers, set...)
+			answers = append(answers, z.sign(t, set, now.Add(-time.Hour), now.Add(24*time.Hour)))
+		} else if set, ok := byName[strings.ToLower(q.Name)+"/CNAME"]; ok {
+			answers = append(answers, set...)
+			answers = append(answers, z.sign(t, set, now.Add(-time.Hour), now.Add(24*time.Hour)))
+		}
+		return reply(req, dns.RcodeSuccess, answers...)
+	}
+}
+
+func TestFollowsValidatedCNAMEWithinZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, signedZone(t, z, now,
+		cname("www.pirate", "app.pirate"),
+		aRecord("app.pirate", "94.103.168.161"),
+	))
+
+	ips, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "www.pirate")
+	if err != nil || !secure {
+		t.Fatalf("CNAME not followed: %v %v", secure, err)
+	}
+	if len(ips) != 1 || ips[0].String() != "94.103.168.161" {
+		t.Fatalf("got %v", ips)
+	}
+}
+
+func TestRejectsUnsignedCNAME(t *testing.T) {
+	// An unsigned alias would let the endpoint redirect a lookup and have the
+	// target validate cleanly.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	a := aRecord("evil.pirate", "203.0.113.9")
+	aSig := z.sign(t, []dns.RR{a}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		switch {
+		case q.Qtype == dns.TypeDNSKEY:
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		case strings.EqualFold(q.Name, "app.pirate."):
+			return reply(req, dns.RcodeSuccess, cname("app.pirate", "evil.pirate")) // no RRSIG
+		default:
+			return reply(req, dns.RcodeSuccess, a, aSig)
+		}
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate"); err == nil {
+		t.Fatal("followed an unsigned CNAME")
+	} else if !errors.Is(err, ErrInsecure) {
+		t.Fatalf("want ErrInsecure, got %v", err)
+	}
+}
+
+func TestRejectsCNAMELeavingAnchoredZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, signedZone(t, z, now, cname("app.pirate", "elsewhere.example")))
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil || !strings.Contains(err.Error(), "outside the anchored zone") {
+		t.Fatalf("expected out-of-zone rejection, got %v", err)
+	}
+}
+
+func TestRejectsCNAMELoop(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, signedZone(t, z, now,
+		cname("a.pirate", "b.pirate"),
+		cname("b.pirate", "a.pirate"),
+	))
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "a.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) {
+		t.Fatalf("expected a bounded rejection of the loop, got %v", err)
+	}
+}
+
+func TestRejectsMultipleCNAMEs(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	set := []dns.RR{cname("app.pirate", "one.pirate"), cname("app.pirate", "two.pirate")}
+	setSig := z.sign(t, set, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		return reply(req, dns.RcodeSuccess, append(append([]dns.RR{}, set...), setSig)...)
+	})
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil || !strings.Contains(err.Error(), "CNAME records") {
+		t.Fatalf("expected multi-CNAME rejection, got %v", err)
+	}
+}
+
+// --- wildcard ---------------------------------------------------------------
+
+func TestRejectsWildcardExpandedAnswer(t *testing.T) {
+	// The signature is genuine; what is missing is proof that no closer name
+	// exists. Without it an endpoint can serve the wildcard in place of a name
+	// that has its own record.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	a := aRecord("anyuser.pirate", "94.103.168.161")
+
+	sig := z.sign(t, []dns.RR{a}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	sig.Labels = 1 // signed as *.pirate, expanded to anyuser.pirate
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		return reply(req, dns.RcodeSuccess, a, sig)
+	})
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "anyuser.pirate")
+	if err == nil {
+		t.Fatal("accepted a wildcard-expanded answer without an NSEC proof")
+	}
+	if !strings.Contains(err.Error(), "wildcard-expanded") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
+	}
+}
+
+func TestExactAnswerStillAcceptedAlongsideWildcardRule(t *testing.T) {
+	// The wildcard check must not reject ordinary answers.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, signedZone(t, z, now, aRecord("app.pirate", "94.103.168.161")))
+
+	if _, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate"); err != nil || !secure {
+		t.Fatalf("exact answer rejected: %v %v", secure, err)
+	}
+}
+
+// chainZone builds n aliases c0 -> c1 -> ... -> cn, with cn holding the address.
+// n is therefore the exact number of aliases that must be followed.
+func chainZone(t *testing.T, z *zone, now time.Time, n int) handler {
+	t.Helper()
+	var rrs []dns.RR
+	for i := 0; i < n; i++ {
+		rrs = append(rrs, cname(fmt.Sprintf("c%d.pirate", i), fmt.Sprintf("c%d.pirate", i+1)))
+	}
+	rrs = append(rrs, aRecord(fmt.Sprintf("c%d.pirate", n), "94.103.168.161"))
+	return signedZone(t, z, now, rrs...)
+}
+
+func TestFollowsExactlyMaxCNAMEDepth(t *testing.T) {
+	// The bound must name the number of aliases actually permitted.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, chainZone(t, z, now, maxCNAMEDepth))
+
+	ips, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "c0.pirate")
+	if err != nil || !secure {
+		t.Fatalf("a chain of exactly %d aliases was rejected: %v %v", maxCNAMEDepth, secure, err)
+	}
+	if len(ips) != 1 || ips[0].String() != "94.103.168.161" {
+		t.Fatalf("got %v", ips)
+	}
+}
+
+func TestRejectsOneMoreThanMaxCNAMEDepth(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, chainZone(t, z, now, maxCNAMEDepth+1))
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "c0.pirate")
+	if err == nil {
+		t.Fatalf("followed %d aliases despite a stated bound of %d", maxCNAMEDepth+1, maxCNAMEDepth)
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
 	}
 }

@@ -705,6 +705,24 @@ func nsec(owner, next string) *dns.NSEC {
 	}
 }
 
+func nsec3For(name, zone, salt string, iterations uint16, flags uint8, next string) *dns.NSEC3 {
+	hash := dns.HashName(dns.Fqdn(name), dns.SHA1, iterations, salt)
+	if next == "" {
+		next = hash
+	}
+	return &dns.NSEC3{
+		Hdr:        dns.RR_Header{Name: hash + "." + dns.Fqdn(zone), Rrtype: dns.TypeNSEC3, Class: dns.ClassINET, Ttl: 300},
+		Hash:       dns.SHA1,
+		Flags:      flags,
+		Iterations: iterations,
+		SaltLength: uint8(len(salt) / 2),
+		Salt:       salt,
+		HashLength: 20,
+		NextDomain: next,
+		TypeBitMap: []uint16{dns.TypeA, dns.TypeRRSIG},
+	}
+}
+
 func TestAcceptsOneLabelWildcardWithValidatedNSECProof(t *testing.T) {
 	z := newZone(t, "pirate")
 	now := time.Unix(1_800_000_000, 0)
@@ -840,6 +858,140 @@ func TestRejectsWildcardSourceAboveAnchoredZone(t *testing.T) {
 	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
 	if err == nil || !strings.Contains(err.Error(), "anchored source") {
 		t.Fatalf("wildcard source above the anchor was accepted or rejected for the wrong reason: %v", err)
+	}
+}
+
+func TestAcceptsAnchoredWildcardWithValidatedNSEC3Proof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	targetHash := dns.HashName(dns.Fqdn(name), dns.SHA1, 1, "aabb")
+	closest := nsec3For("pirate", "pirate", "aabb", 1, 0, targetHash)
+	covering := nsec3For("other.pirate", "pirate", "aabb", 1, 0, "")
+	closestSig := z.sign(t, []dns.RR{closest}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	coveringSig := z.sign(t, []dns.RR{covering}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{closest, closestSig, covering, coveringSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	ips, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
+	if err != nil || !secure || len(ips) != 1 {
+		t.Fatalf("validated NSEC3 wildcard rejected: ips=%v secure=%v err=%v", ips, secure, err)
+	}
+}
+
+func TestRejectsNSEC3ProofWithInconsistentParameters(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	targetHash := dns.HashName(dns.Fqdn(name), dns.SHA1, 1, "aabb")
+	closest := nsec3For("pirate", "pirate", "aabb", 1, 0, targetHash)
+	covering := nsec3For("other.pirate", "pirate", "ccdd", 1, 0, "")
+	closestSig := z.sign(t, []dns.RR{closest}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	coveringSig := z.sign(t, []dns.RR{covering}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{closest, closestSig, covering, coveringSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name); err == nil {
+		t.Fatal("combined NSEC3 closest-encloser and covering records with different parameters")
+	}
+}
+
+func TestRejectsUnsignedNSEC3CoveringProof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	targetHash := dns.HashName(dns.Fqdn(name), dns.SHA1, 1, "aabb")
+	closest := nsec3For("pirate", "pirate", "aabb", 1, 0, targetHash)
+	covering := nsec3For("other.pirate", "pirate", "aabb", 1, 0, "")
+	closestSig := z.sign(t, []dns.RR{closest}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{closest, closestSig, covering} // covering assertion is unsigned
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name); err == nil {
+		t.Fatal("accepted an unsigned NSEC3 next-closer covering record")
+	}
+}
+
+func TestRejectsNSEC3OptOutForWildcardProof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	proof := nsec3For("pirate", "pirate", "aabb", 1, 1, "")
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{proof, proofSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name); err == nil {
+		t.Fatal("accepted NSEC3 opt-out as wildcard denial proof")
+	}
+}
+
+func TestRejectsNSEC3WithExcessiveIterations(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	proof := nsec3For("pirate", "pirate", "aabb", maxNSEC3Iterations+1, 0, "")
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{proof, proofSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name); err == nil {
+		t.Fatal("accepted NSEC3 proof above the iteration work limit")
 	}
 }
 

@@ -5,10 +5,10 @@
 // thing well -- that an RRset was signed by a key the Handshake chain's DS
 // anchor commits to, for a zone anchored at the top level. It does not walk a
 // delegation chain. Its only authenticated-denial support is the plain-NSEC
-// proof for answers synthesized from *.<anchored-zone>; general negative
-// answers, wildcards below another closest encloser, and NSEC3 are refused, not
-// approximated. Do not describe this as "DNSSEC validation" in configuration,
-// docs or release notes.
+// proof for answers synthesized from *.<anchored-zone>, using signed NSEC or
+// conservative NSEC3 without opt-out; general negative answers and wildcards
+// below another closest encloser are refused, not approximated. Do not describe
+// this as "DNSSEC validation" in configuration, docs or release notes.
 //
 // It exists because letsdane's own stub resolver cannot safely be pointed at a
 // remote DoH endpoint:
@@ -337,6 +337,22 @@ func nsecCovers(nsec *dns.NSEC, name string) bool {
 	return ownerName < 0 || nameNext < 0
 }
 
+const maxNSEC3Iterations = 50
+
+func validNSEC3Shape(nsec3 *dns.NSEC3, zone string) bool {
+	return nsec3.Hdr.Class == dns.ClassINET &&
+		nsec3.Hash == dns.SHA1 &&
+		nsec3.Flags == 0 && // opt-out and unknown flags are not valid wildcard proof
+		nsec3.Iterations <= maxNSEC3Iterations &&
+		dns.IsSubDomain(zone, nsec3.Hdr.Name) &&
+		dns.CountLabel(nsec3.Hdr.Name) == dns.CountLabel(zone)+1
+}
+
+func sameNSEC3Params(a, b *dns.NSEC3) bool {
+	return a.Hash == b.Hash && a.Flags == b.Flags && a.Iterations == b.Iterations &&
+		strings.EqualFold(a.Salt, b.Salt)
+}
+
 // zoneOf returns the signing zone this package can anchor: the last label.
 // Deeper delegations need a full chain walk, which validateRRSet refuses rather
 // than approximates.
@@ -529,7 +545,47 @@ func (r *Resolver) proveAnchoredWildcard(ctx context.Context, name, zone string,
 			return nil
 		}
 	}
-	return fmt.Errorf("%w: no validated NSEC record proves next-closer %s absent", ErrInsecure, nextCloser)
+
+	// RFC 5155 closest-encloser proof for a positive wildcard answer: one
+	// validated NSEC3 must match the known closest encloser (the anchored zone),
+	// and another with identical parameters must cover the next-closer name.
+	// Opt-out is rejected above because it can cover an insecure delegation and
+	// is not sufficient evidence that the wildcard applies.
+	var validated []*dns.NSEC3
+	for _, section := range sections {
+		seen := make(map[string]bool)
+		for _, candidate := range section {
+			nsec3, ok := candidate.(*dns.NSEC3)
+			if !ok || !validNSEC3Shape(nsec3, zone) {
+				continue
+			}
+			owner := strings.ToLower(dns.Fqdn(nsec3.Hdr.Name))
+			if seen[owner] {
+				continue
+			}
+			seen[owner] = true
+			records, sigs := rrsetIn(section, nsec3.Hdr.Name, dns.TypeNSEC3)
+			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
+				continue
+			}
+			for _, record := range records {
+				if proof, ok := record.(*dns.NSEC3); ok && validNSEC3Shape(proof, zone) {
+					validated = append(validated, proof)
+				}
+			}
+		}
+	}
+	for _, closest := range validated {
+		if !closest.Match(zone) {
+			continue
+		}
+		for _, covering := range validated {
+			if sameNSEC3Params(closest, covering) && covering.Cover(nextCloser) {
+				return nil
+			}
+		}
+	}
+	return fmt.Errorf("%w: no validated NSEC/NSEC3 proof covers next-closer %s", ErrInsecure, nextCloser)
 }
 
 // maxCNAMEDepth bounds an alias chain. A loop or an absurdly long chain from an

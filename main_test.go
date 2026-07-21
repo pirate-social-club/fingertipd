@@ -186,3 +186,28 @@ func TestDoHFallbackIsOffByDefault(t *testing.T) {
 		t.Fatalf("DoH fallback defaulted to %q; it must be opt-in", cfg.dohEndpoint)
 	}
 }
+
+func TestParseConfigRejectsUnusablePorts(t *testing.T) {
+	// net.SplitHostPort accepts every one of these. Without a numeric check the
+	// mistake surfaces later as an hnsd bind or dial failure, not as a config
+	// error the operator can act on.
+	bad := []string{"127.0.0.1:abc", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:-1", "127.0.0.1:"}
+
+	for _, addr := range bad {
+		if _, err := parseConfig([]string{
+			"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true", "-root-addr", addr,
+		}); err == nil {
+			t.Fatalf("parseConfig accepted -root-addr %q", addr)
+		}
+		if _, err := parseConfig([]string{
+			"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true", "-recursive-addr", addr,
+		}); err == nil {
+			t.Fatalf("parseConfig accepted -recursive-addr %q", addr)
+		}
+		if _, err := parseConfig([]string{
+			"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true", "-hnsd-seed", addr,
+		}); err == nil {
+			t.Fatalf("parseConfig accepted -hnsd-seed %q", addr)
+		}
+	}
+}

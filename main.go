@@ -28,6 +28,7 @@ import (
 	"github.com/miekg/dns"
 	"github.com/pirate-social-club/fingertipd/internal/failover"
 	"github.com/pirate-social-club/fingertipd/internal/hnsanchor"
+	"github.com/pirate-social-club/fingertipd/internal/netutil"
 	"github.com/pirate-social-club/fingertipd/internal/vdoh"
 )
 
@@ -95,15 +96,13 @@ func parseConfig(args []string) (config, error) {
 		return config{}, errors.New("-data-dir and -hnsd-path are required")
 	}
 	for name, addr := range map[string]string{"root": cfg.rootAddr, "recursive": cfg.recursiveAddr} {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil || !net.ParseIP(host).IsLoopback() {
-			return config{}, fmt.Errorf("%s address must be a loopback IP and port: %q", name, addr)
+		if err := netutil.LoopbackHostPort(addr); err != nil {
+			return config{}, fmt.Errorf("%s address %w", name, err)
 		}
 	}
 	if cfg.hnsdSeed != "" {
-		host, _, err := net.SplitHostPort(cfg.hnsdSeed)
-		if err != nil || !net.ParseIP(host).IsLoopback() {
-			return config{}, fmt.Errorf("hnsd seed must be a loopback IP and port: %q", cfg.hnsdSeed)
+		if err := netutil.LoopbackHostPort(cfg.hnsdSeed); err != nil {
+			return config{}, fmt.Errorf("hnsd seed %w", err)
 		}
 	}
 	return cfg, nil

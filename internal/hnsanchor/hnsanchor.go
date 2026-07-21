@@ -28,11 +28,12 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
 	"strings"
 	"time"
 
 	"github.com/miekg/dns"
+
+	"github.com/pirate-social-club/fingertipd/internal/netutil"
 
 	"github.com/pirate-social-club/fingertipd/internal/vdoh"
 )
@@ -57,21 +58,8 @@ type Provider struct {
 // There is deliberately no variant accepting a remote address. If a future
 // caller needs one, that is a design conversation, not a parameter.
 func New(rootAddr string) (*Provider, error) {
-	host, port, err := net.SplitHostPort(rootAddr)
-	if err != nil {
-		return nil, fmt.Errorf("hnsanchor: root address must be host:port: %w", err)
-	}
-	ip := net.ParseIP(host)
-	if ip == nil {
-		// A hostname could resolve anywhere, including off-box, and resolving it
-		// would itself depend on DNS. Require a literal loopback IP.
-		return nil, fmt.Errorf("hnsanchor: root address must be a loopback IP literal, got %q", host)
-	}
-	if !ip.IsLoopback() {
-		return nil, fmt.Errorf("hnsanchor: root address must be loopback, got %q", host)
-	}
-	if port == "" {
-		return nil, errors.New("hnsanchor: root address must include a port")
+	if err := netutil.LoopbackHostPort(rootAddr); err != nil {
+		return nil, fmt.Errorf("hnsanchor: root address %w", err)
 	}
 	return &Provider{rootAddr: rootAddr, timeout: defaultTimeout}, nil
 }

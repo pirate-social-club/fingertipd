@@ -96,6 +96,16 @@ func TestNewRejectsHostname(t *testing.T) {
 	}
 }
 
+func TestNewRejectsUnusablePorts(t *testing.T) {
+	// net.SplitHostPort accepts all of these; without a numeric check they would
+	// surface much later as a dial failure instead of a config error.
+	for _, addr := range []string{"127.0.0.1:abc", "127.0.0.1:0", "127.0.0.1:65536", "127.0.0.1:-1", "127.0.0.1:"} {
+		if _, err := New(addr); err == nil {
+			t.Fatalf("New(%q) accepted an unusable port", addr)
+		}
+	}
+}
+
 func TestNewAcceptsLoopback(t *testing.T) {
 	for _, addr := range []string{"127.0.0.1:5349", "[::1]:5349"} {
 		if _, err := New(addr); err != nil {

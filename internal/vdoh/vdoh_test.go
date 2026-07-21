@@ -1,0 +1,472 @@
+package vdoh
+
+import (
+	"context"
+	"crypto"
+	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/miekg/dns"
+)
+
+// --- test zone -------------------------------------------------------------
+
+type zone struct {
+	name string
+	key  *dns.DNSKEY
+	priv any
+	ds   *dns.DS
+}
+
+func newZone(t *testing.T, name string) *zone {
+	t.Helper()
+	key := &dns.DNSKEY{
+		Hdr:       dns.RR_Header{Name: dns.Fqdn(name), Rrtype: dns.TypeDNSKEY, Class: dns.ClassINET, Ttl: 300},
+		Flags:     257,
+		Protocol:  3,
+		Algorithm: dns.ECDSAP256SHA256,
+	}
+	priv, err := key.Generate(256)
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	return &zone{name: dns.Fqdn(name), key: key, priv: priv, ds: key.ToDS(dns.SHA256)}
+}
+
+func (z *zone) sign(t *testing.T, rrs []dns.RR, inception, expiration time.Time) *dns.RRSIG {
+	t.Helper()
+	sig := &dns.RRSIG{
+		Hdr:         dns.RR_Header{Name: rrs[0].Header().Name, Rrtype: dns.TypeRRSIG, Class: dns.ClassINET, Ttl: 300},
+		TypeCovered: rrs[0].Header().Rrtype,
+		Algorithm:   z.key.Algorithm,
+		Labels:      uint8(dns.CountLabel(rrs[0].Header().Name)),
+		OrigTtl:     rrs[0].Header().Ttl,
+		SignerName:  z.name,
+		KeyTag:      z.key.KeyTag(),
+		Inception:   uint32(inception.Unix()),
+		Expiration:  uint32(expiration.Unix()),
+	}
+	if err := sig.Sign(z.priv.(crypto.Signer), rrs); err != nil {
+		t.Fatalf("sign %s: %v", rrs[0].Header().Name, err)
+	}
+	return sig
+}
+
+func (z *zone) anchor() AnchorFunc {
+	return func(ctx context.Context, name string) ([]*dns.DS, error) {
+		if strings.EqualFold(dns.Fqdn(name), z.name) {
+			return []*dns.DS{z.ds}, nil
+		}
+		return nil, nil
+	}
+}
+
+// --- fake endpoint ---------------------------------------------------------
+
+// handler lets a test decide exactly what the untrusted endpoint returns.
+type handler func(q dns.Question, req *dns.Msg) *dns.Msg
+
+func newEndpoint(t *testing.T, h handler) (*httptest.Server, *Resolver) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, 4096)
+		n, _ := r.Body.Read(body)
+		req := new(dns.Msg)
+		if err := req.Unpack(body[:n]); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		resp := h(req.Question[0], req)
+		if resp == nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		packed, err := resp.Pack()
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("content-type", "application/dns-message")
+		w.Write(packed)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, nil
+}
+
+// reply builds a well-formed response echoing the request identity.
+func reply(req *dns.Msg, rcode int, answers ...dns.RR) *dns.Msg {
+	m := new(dns.Msg)
+	m.SetReply(req)
+	m.Rcode = rcode
+	m.Answer = answers
+	return m
+}
+
+func testResolver(t *testing.T, endpoint string, z *zone) *Resolver {
+	t.Helper()
+	r := &Resolver{
+		Endpoint: endpoint + "/dns-query",
+		Anchor:   z.anchor(),
+		HTTP:     &http.Client{Timeout: 5 * time.Second},
+		Now:      func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	return r
+}
+
+func aRecord(name, ip string) *dns.A {
+	return &dns.A{
+		Hdr: dns.RR_Header{Name: dns.Fqdn(name), Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 300},
+		A:   net.ParseIP(ip),
+	}
+}
+
+// --- endpoint construction -------------------------------------------------
+
+func TestNewRejectsEndpointWithoutQueryPath(t *testing.T) {
+	// letsdane's stub appends "/dns-query"; this package does not. Configuring
+	// an origin here would otherwise silently POST to "/", so it is rejected.
+	for _, bad := range []string{"https://dns.example", "https://dns.example/"} {
+		if _, err := New(bad, func(context.Context, string) ([]*dns.DS, error) { return nil, nil }); err == nil {
+			t.Fatalf("New(%q) accepted an endpoint with no query path", bad)
+		}
+	}
+}
+
+func TestNewRejectsNonHTTPSEndpoint(t *testing.T) {
+	if _, err := New("http://dns.example/dns-query", func(context.Context, string) ([]*dns.DS, error) { return nil, nil }); err == nil {
+		t.Fatal("New accepted a cleartext endpoint")
+	}
+}
+
+func TestRequestUsesEndpointPathVerbatim(t *testing.T) {
+	var gotPath string
+	var gotMethod string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotMethod = r.Method
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	_, _ = r.exchange(context.Background(), "app.pirate", dns.TypeA)
+
+	if gotPath != "/dns-query" {
+		t.Fatalf("requested %q, want /dns-query (no duplicated path)", gotPath)
+	}
+	if gotMethod != http.MethodPost {
+		t.Fatalf("used %s, want POST so the question stays out of the URI", gotMethod)
+	}
+}
+
+func TestQuerySetsDOBit(t *testing.T) {
+	var sawDO bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, 4096)
+		n, _ := r.Body.Read(body)
+		req := new(dns.Msg)
+		if err := req.Unpack(body[:n]); err == nil {
+			if opt := req.IsEdns0(); opt != nil {
+				sawDO = opt.Do()
+			}
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	_, _ = r.exchange(context.Background(), "app.pirate", dns.TypeA)
+
+	if !sawDO {
+		t.Fatal("query did not set the EDNS DO bit; the endpoint is not obliged to return RRSIGs")
+	}
+}
+
+func TestQueryDoesNotRequestAuthenticatedData(t *testing.T) {
+	var sawAD bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body := make([]byte, 4096)
+		n, _ := r.Body.Read(body)
+		req := new(dns.Msg)
+		if err := req.Unpack(body[:n]); err == nil {
+			sawAD = req.AuthenticatedData
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	_, _ = r.exchange(context.Background(), "app.pirate", dns.TypeA)
+
+	if sawAD {
+		t.Fatal("query set AuthenticatedData; this resolver must not rely on the AD bit at all")
+	}
+}
+
+// --- response identity -----------------------------------------------------
+
+func TestRejectsMismatchedMessageID(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Id = req.Id ^ 0xFFFF
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "does not match query id") {
+		t.Fatalf("expected message-id rejection, got %v", err)
+	}
+}
+
+func TestRejectsMismatchedQuestion(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Question[0].Name = "evil.pirate."
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "asked") {
+		t.Fatalf("expected question-mismatch rejection, got %v", err)
+	}
+}
+
+// --- validation ------------------------------------------------------------
+
+func TestAcceptsProperlySignedAnswer(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	a := aRecord("app.pirate", "94.103.168.161")
+	aSig := z.sign(t, []dns.RR{a}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		switch q.Qtype {
+		case dns.TypeDNSKEY:
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		case dns.TypeA:
+			return reply(req, dns.RcodeSuccess, a, aSig)
+		}
+		return reply(req, dns.RcodeSuccess)
+	})
+
+	r := testResolver(t, srv.URL, z)
+	ips, secure, err := r.LookupIP(context.Background(), "ip4", "app.pirate")
+	if err != nil {
+		t.Fatalf("LookupIP: %v", err)
+	}
+	if !secure {
+		t.Fatal("validated answer not reported secure")
+	}
+	if len(ips) != 1 || ips[0].String() != "94.103.168.161" {
+		t.Fatalf("got %v", ips)
+	}
+}
+
+func TestRejectsAnswerWithNoRRSIG(t *testing.T) {
+	// The forged-AD case: endpoint returns a bare answer and asserts AD=true.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		var m *dns.Msg
+		switch q.Qtype {
+		case dns.TypeDNSKEY:
+			m = reply(req, dns.RcodeSuccess, z.key, keySig)
+		default:
+			m = reply(req, dns.RcodeSuccess, aRecord("app.pirate", "203.0.113.9"))
+		}
+		m.AuthenticatedData = true // forged
+		return m
+	})
+
+	r := testResolver(t, srv.URL, z)
+	if _, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate"); err == nil {
+		t.Fatal("accepted an unsigned answer carrying a forged AD bit")
+	} else if !errors.Is(err, ErrInsecure) {
+		t.Fatalf("expected ErrInsecure, got %v", err)
+	}
+}
+
+func TestRejectsExpiredSignature(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	a := aRecord("app.pirate", "94.103.168.161")
+	expired := z.sign(t, []dns.RR{a}, now.Add(-48*time.Hour), now.Add(-24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		return reply(req, dns.RcodeSuccess, a, expired)
+	})
+
+	r := testResolver(t, srv.URL, z)
+	if _, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate"); err == nil {
+		t.Fatal("accepted an expired signature")
+	}
+}
+
+func TestRejectsWhenDSAnchorDoesNotMatchDNSKEY(t *testing.T) {
+	// Endpoint substitutes its own zone key; the chain anchor still commits to
+	// the real one.
+	real := newZone(t, "pirate")
+	attacker := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	a := aRecord("app.pirate", "203.0.113.9")
+	aSig := attacker.sign(t, []dns.RR{a}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := attacker.sign(t, []dns.RR{attacker.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, attacker.key, keySig)
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	r := testResolver(t, srv.URL, real) // anchor = real zone
+	_, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil {
+		t.Fatal("accepted a DNSKEY that no DS anchor commits to")
+	}
+	if !errors.Is(err, ErrInsecure) {
+		t.Fatalf("expected ErrInsecure, got %v", err)
+	}
+	// Assert WHY it failed, not just that it did. Removing the DS<->DNSKEY match
+	// leaves an empty key set, so the downstream signature check would still
+	// reject this -- but for the wrong reason. Pinning the reason is what makes
+	// this test isolate the DS check rather than shadow it.
+	if !strings.Contains(err.Error(), "matches the chain DS anchor") {
+		t.Fatalf("rejected for the wrong reason; want DS-anchor mismatch, got: %v", err)
+	}
+}
+
+func TestRejectsAnchorDSOwnedByAnotherZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	// A provider bug that returns a DS for a different owner must not authorise
+	// keys for the requested zone.
+	wrong := *z.ds
+	wrong.Hdr.Name = "evil.example."
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		return reply(req, dns.RcodeSuccess)
+	})
+	r := &Resolver{
+		Endpoint: srv.URL + "/dns-query",
+		Anchor:   func(context.Context, string) ([]*dns.DS, error) { return []*dns.DS{&wrong}, nil },
+		Now:      func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	_, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil || !strings.Contains(err.Error(), "owned by") {
+		t.Fatalf("expected anchor-owner rejection, got %v", err)
+	}
+}
+
+func TestRejectsNonResponseMessage(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Response = false
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "not a response") {
+		t.Fatalf("expected non-response rejection, got %v", err)
+	}
+}
+
+func TestRejectsUnexpectedOpcode(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Opcode = dns.OpcodeNotify
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "opcode") {
+		t.Fatalf("expected opcode rejection, got %v", err)
+	}
+}
+
+func TestRejectsWrongContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html")
+		w.Write([]byte("<html>not dns</html>"))
+	}))
+	defer srv.Close()
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "content-type") {
+		t.Fatalf("expected content-type rejection, got %v", err)
+	}
+}
+
+func TestRejectsUnsignedDelegation(t *testing.T) {
+	z := newZone(t, "pirate")
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		return reply(req, dns.RcodeSuccess, aRecord("app.dankmeme", "203.0.113.9"))
+	})
+
+	r := &Resolver{
+		Endpoint: srv.URL + "/dns-query",
+		// No DS published for this root, as on an unsigned delegation.
+		Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil },
+		Now:    func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	_ = z
+	if _, _, err := r.LookupIP(context.Background(), "ip4", "app.dankmeme"); err == nil {
+		t.Fatal("accepted an answer from a zone with no DS anchor")
+	} else if !errors.Is(err, ErrInsecure) {
+		t.Fatalf("expected ErrInsecure, got %v", err)
+	}
+}
+
+func TestRejectsTLSAFromUnvalidatedZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		tlsa := &dns.TLSA{
+			Hdr:          dns.RR_Header{Name: "_443._tcp.app.pirate.", Rrtype: dns.TypeTLSA, Class: dns.ClassINET, Ttl: 300},
+			Usage:        3,
+			Selector:     1,
+			MatchingType: 1,
+			Certificate:  strings.Repeat("aa", 32),
+		}
+		return reply(req, dns.RcodeSuccess, tlsa)
+	})
+
+	r := testResolver(t, srv.URL, z) // anchor exists, but nothing is signed
+	if _, _, err := r.LookupTLSA(context.Background(), "443", "tcp", "app.pirate"); err == nil {
+		t.Fatal("accepted an unsigned TLSA record")
+	}
+}
+
+func TestNegativeAnswerIsNotReportedAsProven(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		return reply(req, dns.RcodeNameError)
+	})
+
+	r := testResolver(t, srv.URL, z)
+	_, _, err := r.LookupIP(context.Background(), "ip4", "absent.pirate")
+	if err == nil {
+		t.Fatal("negative answer treated as a result")
+	}
+	if !errors.Is(err, ErrInsecure) {
+		t.Fatalf("NXDOMAIN without NSEC proof must be reported as unvalidatable, got %v", err)
+	}
+}

@@ -24,7 +24,12 @@ import (
 
 	"github.com/buffrr/letsdane"
 	letsresolver "github.com/buffrr/letsdane/resolver"
+
 	"github.com/miekg/dns"
+	"github.com/pirate-social-club/fingertipd/internal/failover"
+	"github.com/pirate-social-club/fingertipd/internal/hnsanchor"
+	"github.com/pirate-social-club/fingertipd/internal/netutil"
+	"github.com/pirate-social-club/fingertipd/internal/vdoh"
 )
 
 const (
@@ -42,6 +47,7 @@ type config struct {
 	rootAddr      string
 	recursiveAddr string
 	hnsdSeed      string
+	dohEndpoint   string
 }
 
 type eventWriter struct {
@@ -66,8 +72,22 @@ func parseConfig(args []string) (config, error) {
 	fs.StringVar(&cfg.rootAddr, "root-addr", "127.0.0.1:15349", "hnsd authoritative DNS listen address")
 	fs.StringVar(&cfg.recursiveAddr, "recursive-addr", "127.0.0.1:15350", "hnsd recursive DNS listen address")
 	fs.StringVar(&cfg.hnsdSeed, "hnsd-seed", "", "optional loopback hnsd peer for hermetic tests")
+	// Off unless explicitly configured. When set, this is a FALLBACK consulted
+	// only when the local node cannot answer; it never becomes the primary.
+	// Answers from it are validated locally against the chain's DS anchor, so
+	// the endpoint is untrusted encrypted transport, not an authority. This is
+	// NOT full DNSSEC validation: see internal/vdoh for the exact scope.
+	fs.StringVar(&cfg.dohEndpoint, "doh-fallback-endpoint", "",
+		"optional https DoH URL (including its query path) used only when the local node cannot answer")
 	if err := fs.Parse(args); err != nil {
 		return config{}, err
+	}
+	// Reject a malformed endpoint here rather than after hnsd has been started:
+	// a configuration error should not cost a subsystem launch to discover.
+	if cfg.dohEndpoint != "" {
+		if err := vdoh.ValidateEndpoint(cfg.dohEndpoint); err != nil {
+			return config{}, err
+		}
 	}
 	if fs.NArg() != 0 {
 		return config{}, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
@@ -76,15 +96,13 @@ func parseConfig(args []string) (config, error) {
 		return config{}, errors.New("-data-dir and -hnsd-path are required")
 	}
 	for name, addr := range map[string]string{"root": cfg.rootAddr, "recursive": cfg.recursiveAddr} {
-		host, _, err := net.SplitHostPort(addr)
-		if err != nil || !net.ParseIP(host).IsLoopback() {
-			return config{}, fmt.Errorf("%s address must be a loopback IP and port: %q", name, addr)
+		if err := netutil.LoopbackHostPort(addr); err != nil {
+			return config{}, fmt.Errorf("%s address %w", name, err)
 		}
 	}
 	if cfg.hnsdSeed != "" {
-		host, _, err := net.SplitHostPort(cfg.hnsdSeed)
-		if err != nil || !net.ParseIP(host).IsLoopback() {
-			return config{}, fmt.Errorf("hnsd seed must be a loopback IP and port: %q", cfg.hnsdSeed)
+		if err := netutil.LoopbackHostPort(cfg.hnsdSeed); err != nil {
+			return config{}, fmt.Errorf("hnsd seed %w", err)
 		}
 	}
 	return cfg, nil
@@ -137,9 +155,32 @@ func run(cfg config, stdout *os.File) error {
 		return err
 	}
 
-	resolver, err := letsresolver.NewStub(cfg.recursiveAddr)
+	localResolver, err := letsresolver.NewStub(cfg.recursiveAddr)
 	if err != nil {
 		return fmt.Errorf("create resolver: %w", err)
+	}
+
+	// The DoH fallback is opt-in and strictly secondary. Its trust anchor comes
+	// from the loopback hnsd root socket -- never from the endpoint itself, and
+	// never from recursive data -- which internal/hnsanchor enforces by refusing
+	// any non-loopback address.
+	var dohFallback failover.Resolver
+	if cfg.dohEndpoint != "" {
+		anchors, err := hnsanchor.New(cfg.rootAddr)
+		if err != nil {
+			return fmt.Errorf("create anchor provider: %w", err)
+		}
+		validating, err := vdoh.New(cfg.dohEndpoint, anchors.Anchor)
+		if err != nil {
+			return fmt.Errorf("create validating doh resolver: %w", err)
+		}
+		dohFallback = validating
+		log.Printf("validated DoH fallback enabled: %s (anchored on %s)", cfg.dohEndpoint, cfg.rootAddr)
+	}
+
+	resolver, err := failover.New(localResolver, dohFallback, log.Printf)
+	if err != nil {
+		return fmt.Errorf("compose resolver: %w", err)
 	}
 	handler, err := (&letsdane.Config{
 		Certificate: ca,

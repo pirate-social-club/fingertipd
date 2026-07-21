@@ -4,9 +4,11 @@
 // SCOPE, deliberately narrow: this is NOT full DNSSEC validation. It proves one
 // thing well -- that an RRset was signed by a key the Handshake chain's DS
 // anchor commits to, for a zone anchored at the top level. It does not walk a
-// delegation chain, and it does not prove negative answers. Those are refused,
-// not approximated, so the boundary stays honest until that work exists. Do not
-// describe this as "DNSSEC validation" in configuration, docs or release notes.
+// delegation chain. Its only authenticated-denial support is the plain-NSEC
+// proof for answers synthesized from *.<anchored-zone>; general negative
+// answers, wildcards below another closest encloser, and NSEC3 are refused, not
+// approximated. Do not describe this as "DNSSEC validation" in configuration,
+// docs or release notes.
 //
 // It exists because letsdane's own stub resolver cannot safely be pointed at a
 // remote DoH endpoint:
@@ -233,9 +235,13 @@ func (r *Resolver) exchange(ctx context.Context, name string, qtype uint16) (*dn
 // rrset returns the records of one type from the answer section, and the RRSIGs
 // covering that type.
 func rrset(msg *dns.Msg, name string, qtype uint16) ([]dns.RR, []*dns.RRSIG) {
+	return rrsetIn(msg.Answer, name, qtype)
+}
+
+func rrsetIn(section []dns.RR, name string, qtype uint16) ([]dns.RR, []*dns.RRSIG) {
 	var records []dns.RR
 	var sigs []*dns.RRSIG
-	for _, rr := range msg.Answer {
+	for _, rr := range section {
 		if !strings.EqualFold(rr.Header().Name, dns.Fqdn(name)) {
 			continue
 		}
@@ -251,6 +257,84 @@ func rrset(msg *dns.Msg, name string, qtype uint16) ([]dns.RR, []*dns.RRSIG) {
 		}
 	}
 	return records, sigs
+}
+
+// canonicalNameCompare implements the DNSSEC canonical name ordering from RFC
+// 4034 section 6.1. Labels are compared case-insensitively from the root toward
+// the leaf; a name with fewer otherwise-equal labels sorts first.
+func canonicalLabels(name string) ([][]byte, bool) {
+	wire := make([]byte, 255)
+	n, err := dns.PackDomainName(dns.Fqdn(name), wire, 0, nil, false)
+	if err != nil {
+		return nil, false
+	}
+	var labels [][]byte
+	for off := 0; off < n; {
+		length := int(wire[off])
+		off++
+		if length == 0 {
+			return labels, off == n
+		}
+		if length > 63 || off+length > n {
+			return nil, false
+		}
+		label := append([]byte(nil), wire[off:off+length]...)
+		for i, b := range label {
+			if b >= 'A' && b <= 'Z' {
+				label[i] = b + ('a' - 'A')
+			}
+		}
+		labels = append(labels, label)
+		off += length
+	}
+	return nil, false
+}
+
+func canonicalNameCompare(a, b string) (int, bool) {
+	la, ok := canonicalLabels(a)
+	if !ok {
+		return 0, false
+	}
+	lb, ok := canonicalLabels(b)
+	if !ok {
+		return 0, false
+	}
+	for ia, ib := len(la)-1, len(lb)-1; ia >= 0 && ib >= 0; ia, ib = ia-1, ib-1 {
+		if c := bytes.Compare(la[ia], lb[ib]); c != 0 {
+			return c, true
+		}
+	}
+	switch {
+	case len(la) < len(lb):
+		return -1, true
+	case len(la) > len(lb):
+		return 1, true
+	default:
+		return 0, true
+	}
+}
+
+func nsecCovers(nsec *dns.NSEC, name string) bool {
+	owner := dns.Fqdn(nsec.Hdr.Name)
+	next := dns.Fqdn(nsec.NextDomain)
+	name = dns.Fqdn(name)
+	ownerName, ok := canonicalNameCompare(owner, name)
+	if !ok || ownerName == 0 {
+		return false // an exact owner proves existence, not non-existence
+	}
+	ownerNext, ok := canonicalNameCompare(owner, next)
+	if !ok {
+		return false
+	}
+	nameNext, ok := canonicalNameCompare(name, next)
+	if !ok {
+		return false
+	}
+	if ownerNext < 0 {
+		return ownerName < 0 && nameNext < 0
+	}
+	// The last NSEC in canonical order wraps through the root to the first.
+	return ownerName < 0 || nameNext < 0
 }
 
 // zoneOf returns the signing zone this package can anchor: the last label.
@@ -351,6 +435,10 @@ func anchoredMap(keys []*dns.DNSKEY) map[uint16]*dns.DNSKEY {
 // verifySigs requires at least one RRSIG over the RRset that is currently valid
 // and verifies under one of the supplied keys.
 func (r *Resolver) verifySigs(records []dns.RR, sigs []*dns.RRSIG, zone string, keys map[uint16]*dns.DNSKEY) error {
+	return r.verifySigsWithWildcard(records, sigs, zone, keys, false)
+}
+
+func (r *Resolver) verifySigsWithWildcard(records []dns.RR, sigs []*dns.RRSIG, zone string, keys map[uint16]*dns.DNSKEY, allowWildcard bool) error {
 	now := r.now()
 	var lastErr error
 	for _, sig := range sigs {
@@ -368,8 +456,18 @@ func (r *Resolver) verifySigs(records []dns.RR, sigs []*dns.RRSIG, zone string, 
 		// of a name that has its own, more specific record. Both are signed by
 		// the zone, so only the denial proof distinguishes them.
 		if owner := records[0].Header().Name; int(sig.Labels) < dns.CountLabel(owner) {
-			lastErr = fmt.Errorf("answer for %s is wildcard-expanded, which cannot be proven without NSEC", owner)
-			continue
+			if !allowWildcard {
+				lastErr = fmt.Errorf("answer for %s is wildcard-expanded, which cannot be proven without NSEC", owner)
+				continue
+			}
+			// This implementation proves only *.<anchored-zone>. A lower label
+			// count names a wildcard above the trust anchor; a higher one needs
+			// a deeper closest-encloser proof.
+			if int(sig.Labels) != dns.CountLabel(zone) {
+				lastErr = fmt.Errorf("wildcard signature for %s has %d labels, want anchored source *.%s",
+					owner, sig.Labels, zone)
+				continue
+			}
 		}
 		if !sig.ValidityPeriod(now) {
 			lastErr = fmt.Errorf("signature by key %d is outside its validity period", sig.KeyTag)
@@ -390,6 +488,48 @@ func (r *Resolver) verifySigs(records []dns.RR, sigs []*dns.RRSIG, zone string, 
 		lastErr = errors.New("no RRSIG covering the record set")
 	}
 	return lastErr
+}
+
+// proveAnchoredWildcard validates the NSEC proof for an answer whose RRSIG says
+// its source is *.<anchored-zone>. The anchored zone's existence is already
+// established by its DS/DNSKEY chain. RFC 4035 then requires authenticated
+// denial of the next-closer name: the suffix containing one label more than the
+// closest encloser. This also handles DANE names such as
+// _443._tcp.<handle>.pirate, whose source is still *.pirate.
+func (r *Resolver) proveAnchoredWildcard(ctx context.Context, name, zone string, keys map[uint16]*dns.DNSKEY) error {
+	nameLabels := dns.SplitDomainName(dns.Fqdn(name))
+	zoneLabels := dns.SplitDomainName(dns.Fqdn(zone))
+	if len(nameLabels) <= len(zoneLabels) {
+		return fmt.Errorf("%w: wildcard name %s is not below %s", ErrInsecure, name, zone)
+	}
+	nextCloser := dns.Fqdn(strings.Join(nameLabels[len(nameLabels)-len(zoneLabels)-1:], "."))
+
+	msg, err := r.exchange(ctx, name, dns.TypeNSEC)
+	if err != nil {
+		return err
+	}
+	if msg.Rcode != dns.RcodeSuccess && msg.Rcode != dns.RcodeNameError {
+		return fmt.Errorf("%w: NSEC proof lookup for %s returned %s", ErrInsecure, name, dns.RcodeToString[msg.Rcode])
+	}
+
+	sections := [][]dns.RR{msg.Answer, msg.Ns}
+	for _, section := range sections {
+		for _, candidate := range section {
+			nsec, ok := candidate.(*dns.NSEC)
+			if !ok || !nsecCovers(nsec, nextCloser) {
+				continue
+			}
+			if nsec.Hdr.Class != dns.ClassINET || !dns.IsSubDomain(zone, nsec.Hdr.Name) || !dns.IsSubDomain(zone, nsec.NextDomain) {
+				continue
+			}
+			records, sigs := rrsetIn(section, nsec.Hdr.Name, dns.TypeNSEC)
+			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
+				continue
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: no validated NSEC record proves next-closer %s absent", ErrInsecure, nextCloser)
 }
 
 // maxCNAMEDepth bounds an alias chain. A loop or an absurdly long chain from an
@@ -428,7 +568,19 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 		}
 
 		if records, sigs := rrset(msg, current, qtype); len(records) > 0 {
-			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
+			wildcard := false
+			for _, sig := range sigs {
+				if int(sig.Labels) < dns.CountLabel(records[0].Header().Name) {
+					wildcard = true
+					break
+				}
+			}
+			if wildcard {
+				if err := r.proveAnchoredWildcard(ctx, current, zone, keys); err != nil {
+					return nil, err
+				}
+			}
+			if err := r.verifySigsWithWildcard(records, sigs, zone, keys, wildcard); err != nil {
 				return nil, fmt.Errorf("%w: %s: %v", ErrInsecure, current, err)
 			}
 			return records, nil

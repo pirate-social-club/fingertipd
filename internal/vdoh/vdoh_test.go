@@ -622,8 +622,43 @@ func TestRejectsWildcardExpandedAnswer(t *testing.T) {
 	if err == nil {
 		t.Fatal("accepted a wildcard-expanded answer without an NSEC proof")
 	}
-	if !strings.Contains(err.Error(), "wildcard-expanded") {
+	if !strings.Contains(err.Error(), "no validated NSEC") {
 		t.Fatalf("rejected for the wrong reason: %v", err)
+	}
+}
+
+func TestNSECCoverageUsesCanonicalOrderAndWrap(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		rr   *dns.NSEC
+		q    string
+		want bool
+	}{
+		{"inside", nsec("aaa.pirate", "zzz.pirate"), "handle.pirate", true},
+		{"lower boundary", nsec("aaa.pirate", "zzz.pirate"), "aaa.pirate", false},
+		{"upper boundary", nsec("aaa.pirate", "zzz.pirate"), "zzz.pirate", false},
+		{"outside", nsec("one.pirate", "two.pirate"), "handle.pirate", false},
+		{"wrap high", nsec("zzz.pirate", "aaa.pirate"), "zzzz.pirate", true},
+		{"wrap low", nsec("zzz.pirate", "aaa.pirate"), "0.pirate", true},
+		{"wrap middle", nsec("zzz.pirate", "aaa.pirate"), "handle.pirate", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := nsecCovers(tc.rr, tc.q); got != tc.want {
+				t.Fatalf("nsecCovers(%s -> %s, %s)=%v, want %v", tc.rr.Hdr.Name, tc.rr.NextDomain, tc.q, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestCanonicalNameOrderUsesWireLabels(t *testing.T) {
+	if got, ok := canonicalNameCompare(`A.pirate.`, `a.pirate.`); !ok || got != 0 {
+		t.Fatalf("ASCII case was not folded canonically: got=%d ok=%v", got, ok)
+	}
+	if got, ok := canonicalNameCompare(`\097.pirate.`, `a.pirate.`); !ok || got != 0 {
+		t.Fatalf("escaped wire octet was not compared canonically: got=%d ok=%v", got, ok)
+	}
+	if _, ok := canonicalNameCompare(strings.Repeat("a", 64)+`.pirate.`, `a.pirate.`); ok {
+		t.Fatal("overlong label was assigned a canonical order")
 	}
 }
 
@@ -635,6 +670,176 @@ func TestExactAnswerStillAcceptedAlongsideWildcardRule(t *testing.T) {
 
 	if _, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate"); err != nil || !secure {
 		t.Fatalf("exact answer rejected: %v %v", secure, err)
+	}
+}
+
+func validWildcardAnswer(t *testing.T, z *zone, now time.Time, expandedName string) (*dns.A, *dns.RRSIG) {
+	t.Helper()
+	wild := aRecord("*.pirate", "94.103.168.161")
+	sig := z.sign(t, []dns.RR{wild}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	wild.Hdr.Name = dns.Fqdn(expandedName)
+	sig.Hdr.Name = dns.Fqdn(expandedName)
+	return wild, sig
+}
+
+func validWildcardTLSA(t *testing.T, z *zone, now time.Time, expandedName string) (*dns.TLSA, *dns.RRSIG) {
+	t.Helper()
+	wild := &dns.TLSA{
+		Hdr:          dns.RR_Header{Name: "*.pirate.", Rrtype: dns.TypeTLSA, Class: dns.ClassINET, Ttl: 300},
+		Usage:        3,
+		Selector:     1,
+		MatchingType: 1,
+		Certificate:  strings.Repeat("ab", 32),
+	}
+	sig := z.sign(t, []dns.RR{wild}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	wild.Hdr.Name = dns.Fqdn(expandedName)
+	sig.Hdr.Name = dns.Fqdn(expandedName)
+	return wild, sig
+}
+
+func nsec(owner, next string) *dns.NSEC {
+	return &dns.NSEC{
+		Hdr:        dns.RR_Header{Name: dns.Fqdn(owner), Rrtype: dns.TypeNSEC, Class: dns.ClassINET, Ttl: 300},
+		NextDomain: dns.Fqdn(next),
+		TypeBitMap: []uint16{dns.TypeA, dns.TypeRRSIG, dns.TypeNSEC},
+	}
+}
+
+func TestAcceptsOneLabelWildcardWithValidatedNSECProof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	denial := nsec("aaa.pirate", "zzz.pirate")
+	denialSig := z.sign(t, []dns.RR{denial}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		switch q.Qtype {
+		case dns.TypeDNSKEY:
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		case dns.TypeNSEC:
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{denial, denialSig}
+			return m
+		default:
+			return reply(req, dns.RcodeSuccess, a, aSig)
+		}
+	})
+
+	ips, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
+	if err != nil || !secure || len(ips) != 1 || ips[0].String() != "94.103.168.161" {
+		t.Fatalf("validated wildcard rejected: ips=%v secure=%v err=%v", ips, secure, err)
+	}
+}
+
+func TestRejectsWildcardWithUnsignedNSECProof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	denial := nsec("aaa.pirate", "zzz.pirate")
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		switch q.Qtype {
+		case dns.TypeDNSKEY:
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		case dns.TypeNSEC:
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{denial} // endpoint assertion, not a proof
+			return m
+		default:
+			return reply(req, dns.RcodeSuccess, a, aSig)
+		}
+	})
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
+	if err == nil || !strings.Contains(err.Error(), "no validated NSEC") {
+		t.Fatalf("unsigned denial accepted or rejected for the wrong reason: %v", err)
+	}
+}
+
+func TestRejectsWildcardWhenNSECDoesNotCoverName(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	denial := nsec("one.pirate", "two.pirate")
+	denialSig := z.sign(t, []dns.RR{denial}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{denial, denialSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	if _, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name); err == nil {
+		t.Fatal("accepted a denial interval that does not cover the expanded name")
+	}
+}
+
+func TestAcceptsDANENameSynthesizedFromAnchoredWildcard(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "_443._tcp.handle.pirate"
+	tlsa, tlsaSig := validWildcardTLSA(t, z, now, name)
+	// Covers next-closer handle.pirate, but not the full query name. This pins
+	// the RFC next-closer derivation; checking the expanded owner directly would
+	// reject this otherwise valid proof.
+	denial := nsec("aaa.pirate", "!.handle.pirate")
+	denialSig := z.sign(t, []dns.RR{denial}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{denial, denialSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, tlsa, tlsaSig)
+	})
+
+	records, secure, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "handle.pirate")
+	if err != nil || !secure || len(records) != 1 {
+		t.Fatalf("DANE name from *.pirate rejected: records=%v secure=%v err=%v", records, secure, err)
+	}
+}
+
+func TestRejectsWildcardSourceAboveAnchoredZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	rootWildcard, aSig := validWildcardAnswer(t, z, now, name)
+	aSig.Labels = 0 // claims a wildcard source above the anchored .pirate zone
+
+	denial := nsec("aaa.pirate", "zzz.pirate")
+	denialSig := z.sign(t, []dns.RR{denial}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{denial, denialSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, rootWildcard, aSig)
+	})
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
+	if err == nil || !strings.Contains(err.Error(), "anchored source") {
+		t.Fatalf("wildcard source above the anchor was accepted or rejected for the wrong reason: %v", err)
 	}
 }
 

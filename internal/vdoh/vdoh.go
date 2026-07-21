@@ -83,27 +83,37 @@ type Resolver struct {
 	Now func() time.Time
 }
 
+// ValidateEndpoint checks a DoH endpoint URL without needing an anchor, so a
+// misconfiguration can be rejected at flag-parse time rather than after the
+// process has started subsystems.
+func ValidateEndpoint(endpoint string) error {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return fmt.Errorf("vdoh: invalid endpoint: %w", err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("vdoh: endpoint must be https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return errors.New("vdoh: endpoint has no host")
+	}
+	// Require an explicit path. The common mistake this guards against is
+	// configuring an origin and assuming "/dns-query" is appended, which is what
+	// letsdane's stub does and this package deliberately does not.
+	if u.Path == "" || u.Path == "/" {
+		return errors.New("vdoh: endpoint must include the query path, e.g. https://host/dns-query")
+	}
+	return nil
+}
+
 // New validates configuration up front so a misconfigured endpoint fails at
 // startup rather than silently on the first lookup.
 func New(endpoint string, anchor AnchorFunc) (*Resolver, error) {
 	if anchor == nil {
 		return nil, errors.New("vdoh: anchor function is required")
 	}
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("vdoh: invalid endpoint: %w", err)
-	}
-	if u.Scheme != "https" {
-		return nil, fmt.Errorf("vdoh: endpoint must be https, got %q", u.Scheme)
-	}
-	if u.Host == "" {
-		return nil, errors.New("vdoh: endpoint has no host")
-	}
-	// Require an explicit path. The common mistake this guards against is
-	// configuring an origin and assuming "/dns-query" is appended, which is what
-	// letsdane's stub does and this package deliberately does not.
-	if u.Path == "" || u.Path == "/" {
-		return nil, errors.New("vdoh: endpoint must include the query path, e.g. https://host/dns-query")
+	if err := ValidateEndpoint(endpoint); err != nil {
+		return nil, err
 	}
 	return &Resolver{Endpoint: endpoint, Anchor: anchor}, nil
 }

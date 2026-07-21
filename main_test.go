@@ -145,3 +145,44 @@ func assertPair(t *testing.T, cert *x509.Certificate, key *rsa.PrivateKey) {
 		t.Fatal("certificate and key do not match")
 	}
 }
+
+func TestParseConfigRejectsBadDoHEndpointAtParseTime(t *testing.T) {
+	// A configuration error must not cost an hnsd launch to discover.
+	for _, bad := range []string{
+		"http://dns.pirate.sc/dns-query", // not https
+		"https://dns.pirate.sc",          // no query path
+		"https://dns.pirate.sc/",         // no query path
+	} {
+		_, err := parseConfig([]string{
+			"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true",
+			"-doh-fallback-endpoint", bad,
+		})
+		if err == nil {
+			t.Fatalf("parseConfig accepted %q", bad)
+		}
+	}
+}
+
+func TestParseConfigAcceptsValidDoHEndpoint(t *testing.T) {
+	cfg, err := parseConfig([]string{
+		"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true",
+		"-doh-fallback-endpoint", "https://dns.pirate.sc/dns-query",
+	})
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.dohEndpoint != "https://dns.pirate.sc/dns-query" {
+		t.Fatalf("endpoint not recorded: %q", cfg.dohEndpoint)
+	}
+}
+
+func TestDoHFallbackIsOffByDefault(t *testing.T) {
+	// The fallback must never be enabled implicitly.
+	cfg, err := parseConfig([]string{"-data-dir", t.TempDir(), "-hnsd-path", "/bin/true"})
+	if err != nil {
+		t.Fatalf("parseConfig: %v", err)
+	}
+	if cfg.dohEndpoint != "" {
+		t.Fatalf("DoH fallback defaulted to %q; it must be opt-in", cfg.dohEndpoint)
+	}
+}

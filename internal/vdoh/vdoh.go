@@ -1,5 +1,12 @@
-// Package vdoh implements letsdane's resolver.Resolver over DNS-over-HTTPS
-// with local DNSSEC validation.
+// Package vdoh implements letsdane's resolver.Resolver over DNS-over-HTTPS with
+// local, top-level anchored RRset validation.
+//
+// SCOPE, deliberately narrow: this is NOT full DNSSEC validation. It proves one
+// thing well -- that an RRset was signed by a key the Handshake chain's DS
+// anchor commits to, for a zone anchored at the top level. It does not walk a
+// delegation chain, and it does not prove negative answers. Those are refused,
+// not approximated, so the boundary stays honest until that work exists. Do not
+// describe this as "DNSSEC validation" in configuration, docs or release notes.
 //
 // It exists because letsdane's own stub resolver cannot safely be pointed at a
 // remote DoH endpoint:
@@ -21,6 +28,11 @@
 // Handshake root.
 //
 // The DoH endpoint is untrusted encrypted transport. It is not an authority.
+//
+// ANCHOR PROVIDER CONTRACT: the AnchorFunc supplied at wiring time must read
+// only synced loopback Handshake root state. It must never be sourced from
+// recursive or DoH data -- that would make the endpoint the origin of its own
+// trust anchor and defeat the entire package.
 package vdoh
 
 import (
@@ -31,6 +43,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/url"
@@ -159,6 +172,12 @@ func (r *Resolver) exchange(ctx context.Context, name string, qtype uint16) (*dn
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("vdoh: endpoint returned HTTP %d", resp.StatusCode)
 	}
+	// Require the DoH media type. A response of any other type is not a DNS
+	// message we asked for, whatever its bytes happen to unpack as.
+	ctype := resp.Header.Get("content-type")
+	if mediaType, _, err := mime.ParseMediaType(ctype); err != nil || !strings.EqualFold(mediaType, "application/dns-message") {
+		return nil, fmt.Errorf("vdoh: endpoint returned content-type %q, want application/dns-message", ctype)
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
@@ -171,6 +190,15 @@ func (r *Resolver) exchange(ctx context.Context, name string, qtype uint16) (*dn
 	out := new(dns.Msg)
 	if err := out.Unpack(body); err != nil {
 		return nil, fmt.Errorf("vdoh: malformed response: %w", err)
+	}
+
+	// Message-level checks first: reject anything that is not a response to a
+	// query before looking at any record it carries.
+	if !out.Response {
+		return nil, errors.New("vdoh: message is not a response")
+	}
+	if out.Opcode != dns.OpcodeQuery {
+		return nil, fmt.Errorf("vdoh: unexpected opcode %s", dns.OpcodeToString[out.Opcode])
 	}
 
 	// Response identity. An endpoint that answers a different question, or
@@ -237,6 +265,23 @@ func (r *Resolver) validatedKeys(ctx context.Context, zone string) (map[uint16]*
 		// An unsigned or missing delegation is not an error to be tolerated: we
 		// cannot prove anything about the zone, so nothing from it is usable.
 		return nil, fmt.Errorf("%w: no DS anchor published for %s", ErrInsecure, zone)
+	}
+	// The anchor is the root of all trust here, so its shape is checked rather
+	// than assumed. A DS for some other owner would otherwise let a provider bug
+	// authorise keys for a zone the chain never delegated.
+	for _, ds := range anchors {
+		if ds == nil {
+			return nil, fmt.Errorf("%w: anchor for %s contains a nil DS", ErrInsecure, zone)
+		}
+		if ds.Hdr.Rrtype != dns.TypeDS {
+			return nil, fmt.Errorf("%w: anchor for %s contains record type %s, want DS", ErrInsecure, zone, dns.TypeToString[ds.Hdr.Rrtype])
+		}
+		if ds.Hdr.Class != dns.ClassINET {
+			return nil, fmt.Errorf("%w: anchor for %s contains class %d, want IN", ErrInsecure, zone, ds.Hdr.Class)
+		}
+		if !strings.EqualFold(dns.Fqdn(ds.Hdr.Name), dns.Fqdn(zone)) {
+			return nil, fmt.Errorf("%w: anchor returned DS owned by %q for zone %q", ErrInsecure, ds.Hdr.Name, zone)
+		}
 	}
 
 	msg, err := r.exchange(ctx, zone, dns.TypeDNSKEY)

@@ -334,10 +334,79 @@ func TestRejectsWhenDSAnchorDoesNotMatchDNSKEY(t *testing.T) {
 	})
 
 	r := testResolver(t, srv.URL, real) // anchor = real zone
-	if _, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate"); err == nil {
+	_, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil {
 		t.Fatal("accepted a DNSKEY that no DS anchor commits to")
-	} else if !errors.Is(err, ErrInsecure) {
+	}
+	if !errors.Is(err, ErrInsecure) {
 		t.Fatalf("expected ErrInsecure, got %v", err)
+	}
+	// Assert WHY it failed, not just that it did. Removing the DS<->DNSKEY match
+	// leaves an empty key set, so the downstream signature check would still
+	// reject this -- but for the wrong reason. Pinning the reason is what makes
+	// this test isolate the DS check rather than shadow it.
+	if !strings.Contains(err.Error(), "matches the chain DS anchor") {
+		t.Fatalf("rejected for the wrong reason; want DS-anchor mismatch, got: %v", err)
+	}
+}
+
+func TestRejectsAnchorDSOwnedByAnotherZone(t *testing.T) {
+	z := newZone(t, "pirate")
+	// A provider bug that returns a DS for a different owner must not authorise
+	// keys for the requested zone.
+	wrong := *z.ds
+	wrong.Hdr.Name = "evil.example."
+
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		return reply(req, dns.RcodeSuccess)
+	})
+	r := &Resolver{
+		Endpoint: srv.URL + "/dns-query",
+		Anchor:   func(context.Context, string) ([]*dns.DS, error) { return []*dns.DS{&wrong}, nil },
+		Now:      func() time.Time { return time.Unix(1_800_000_000, 0) },
+	}
+	_, _, err := r.LookupIP(context.Background(), "ip4", "app.pirate")
+	if err == nil || !strings.Contains(err.Error(), "owned by") {
+		t.Fatalf("expected anchor-owner rejection, got %v", err)
+	}
+}
+
+func TestRejectsNonResponseMessage(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Response = false
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "not a response") {
+		t.Fatalf("expected non-response rejection, got %v", err)
+	}
+}
+
+func TestRejectsUnexpectedOpcode(t *testing.T) {
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		m := reply(req, dns.RcodeSuccess)
+		m.Opcode = dns.OpcodeNotify
+		return m
+	})
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "opcode") {
+		t.Fatalf("expected opcode rejection, got %v", err)
+	}
+}
+
+func TestRejectsWrongContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("content-type", "text/html")
+		w.Write([]byte("<html>not dns</html>"))
+	}))
+	defer srv.Close()
+	r := &Resolver{Endpoint: srv.URL + "/dns-query", Anchor: func(context.Context, string) ([]*dns.DS, error) { return nil, nil }}
+	if _, err := r.exchange(context.Background(), "app.pirate", dns.TypeA); err == nil ||
+		!strings.Contains(err.Error(), "content-type") {
+		t.Fatalf("expected content-type rejection, got %v", err)
 	}
 }
 

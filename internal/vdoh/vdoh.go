@@ -93,6 +93,13 @@ type Resolver struct {
 	Now func() time.Time
 }
 
+// SupportsDelegatedZones reports whether this validator can walk DS/DNSKEY
+// chains below the Handshake top-level anchor. It is intentionally false until
+// that complete chain walk exists. The executable uses this as a runtime gate:
+// a DoH endpoint may be explicitly enabled for controlled top-level use, but it
+// cannot become an implicit default while community roots would fail closed.
+func SupportsDelegatedZones() bool { return false }
+
 // ValidateEndpoint checks a DoH endpoint URL without needing an anchor, so a
 // misconfiguration can be rejected at flag-parse time rather than after the
 // process has started subsystems.

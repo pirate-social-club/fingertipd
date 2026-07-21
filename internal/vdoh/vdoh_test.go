@@ -723,6 +723,152 @@ func nsec3For(name, zone, salt string, iterations uint16, flags uint8, next stri
 	}
 }
 
+func negativeEndpoint(t *testing.T, z *zone, now time.Time, rcode int, proofs ...dns.RR) *httptest.Server {
+	t.Helper()
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		m := reply(req, rcode)
+		m.Ns = proofs
+		return m
+	})
+	return srv
+}
+
+func TestTLSAProvenNODATANeverReturnsEmptySecureSuccess(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	proof := nsec("_443._tcp.app.pirate", "api.pirate")
+	proof.TypeBitMap = []uint16{dns.TypeRRSIG, dns.TypeNSEC} // no TLSA and no CNAME
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	records, secure, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("proven TLSA absence must be a typed error, got records=%v secure=%v err=%v", records, secure, err)
+	}
+	if len(records) == 0 && secure && err == nil {
+		t.Fatal("returned the letsdane plain-tunnel sentinel (empty, secure, nil)")
+	}
+}
+
+func TestNODATABitmapClaimingTLSAExistsIsRejected(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	proof := nsec("_443._tcp.app.pirate", "api.pirate")
+	proof.TypeBitMap = []uint16{dns.TypeRRSIG, dns.TypeNSEC, dns.TypeTLSA}
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) || errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("contradictory TLSA bitmap accepted or misclassified: %v", err)
+	}
+}
+
+func TestNODATABitmapClaimingCNAMEExistsIsRejected(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	proof := nsec("_443._tcp.app.pirate", "api.pirate")
+	proof.TypeBitMap = []uint16{dns.TypeCNAME, dns.TypeRRSIG, dns.TypeNSEC}
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) || errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("CNAME-bearing NODATA bitmap accepted or misclassified: %v", err)
+	}
+}
+
+func TestProvesNXDOMAINWithSignedNSECNextCloserAndWildcardDenial(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	nameProof := nsec("aaa.pirate", "zzz.pirate")
+	wildcardProof := nsec("!.pirate", "+.pirate")
+	nameSig := z.sign(t, []dns.RR{nameProof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	wildcardSig := z.sign(t, []dns.RR{wildcardProof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeNameError, nameProof, nameSig, wildcardProof, wildcardSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "handle.pirate")
+	if err == nil || !errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("signed NXDOMAIN was not classified as proven absent: %v", err)
+	}
+}
+
+func TestRejectsNXDOMAINWithoutWildcardDenial(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	nameProof := nsec("aaa.pirate", "zzz.pirate")
+	nameSig := z.sign(t, []dns.RR{nameProof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeNameError, nameProof, nameSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "handle.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) || errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("NXDOMAIN without wildcard denial accepted or misclassified: %v", err)
+	}
+}
+
+func TestNXDOMAINUsesLongestValidatedClosestEncloser(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	// Exact owner proves existing.pirate exists. Its interval covers both the
+	// next-closer missing.existing.pirate and *.existing.pirate. Treating the
+	// apex as closest would instead test existing.pirate itself and fail.
+	proof := nsec("existing.pirate", "zzz.pirate")
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeNameError, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "missing.existing.pirate")
+	if err == nil || !errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("nested NXDOMAIN did not use the signed closest encloser: %v", err)
+	}
+}
+
+func TestProvesNODATAWithSignedNSEC3Bitmap(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	qname := "_443._tcp.app.pirate"
+	proof := nsec3For(qname, "pirate", "aabb", 1, 0, "")
+	proof.TypeBitMap = []uint16{dns.TypeRRSIG}
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("signed NSEC3 NODATA was not classified as proven absent: %v", err)
+	}
+}
+
+func TestRejectsNSEC3NODATABitmapClaimingTLSAExists(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	qname := "_443._tcp.app.pirate"
+	proof := nsec3For(qname, "pirate", "aabb", 1, 0, "")
+	proof.TypeBitMap = []uint16{dns.TypeRRSIG, dns.TypeTLSA}
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) || errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("contradictory NSEC3 TLSA bitmap accepted or misclassified: %v", err)
+	}
+}
+
+func TestProvesNXDOMAINWithSignedNSEC3ClosestAndCoveringProof(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	proof := nsec3For("pirate", "pirate", "aabb", 1, 0, "")
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeNameError, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "handle.pirate")
+	if err == nil || !errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("signed NSEC3 NXDOMAIN was not classified as proven absent: %v", err)
+	}
+}
+
 func TestAcceptsOneLabelWildcardWithValidatedNSECProof(t *testing.T) {
 	z := newZone(t, "pirate")
 	now := time.Unix(1_800_000_000, 0)

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,10 +16,24 @@ import (
 
 // fakeRoot stands in for hnsd's root server on loopback.
 type fakeRoot struct {
+	mu      sync.RWMutex
 	synced  string // value returned for synced.chain.hnsd
 	ds      []dns.RR
 	dsRcode int
 	mangle  func(req, resp *dns.Msg)
+}
+
+func (f *fakeRoot) snapshot() (string, []dns.RR, int, func(*dns.Msg, *dns.Msg)) {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.synced, append([]dns.RR(nil), f.ds...), f.dsRcode, f.mangle
+}
+
+func (f *fakeRoot) setState(synced string, ds []dns.RR) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.synced = synced
+	f.ds = append([]dns.RR(nil), ds...)
 }
 
 func startRoot(t *testing.T, f *fakeRoot) string {
@@ -29,25 +44,26 @@ func startRoot(t *testing.T, f *fakeRoot) string {
 	}
 	srv := &dns.Server{PacketConn: pc}
 	srv.Handler = dns.HandlerFunc(func(w dns.ResponseWriter, req *dns.Msg) {
+		synced, records, rcode, mangle := f.snapshot()
 		resp := new(dns.Msg)
 		resp.SetReply(req)
 		q := req.Question[0]
 
 		switch {
 		case q.Qclass == dns.ClassHESIOD && q.Qtype == dns.TypeTXT:
-			if f.synced != "" {
+			if synced != "" {
 				resp.Answer = append(resp.Answer, &dns.TXT{
 					Hdr: dns.RR_Header{Name: q.Name, Rrtype: dns.TypeTXT, Class: dns.ClassHESIOD, Ttl: 0},
-					Txt: []string{f.synced},
+					Txt: []string{synced},
 				})
 			}
 		case q.Qtype == dns.TypeDS:
-			resp.Rcode = f.dsRcode
-			resp.Answer = append(resp.Answer, f.ds...)
+			resp.Rcode = rcode
+			resp.Answer = append(resp.Answer, records...)
 		}
 
-		if f.mangle != nil {
-			f.mangle(req, resp)
+		if mangle != nil {
+			mangle(req, resp)
 		}
 		_ = w.WriteMsg(resp)
 	})
@@ -291,7 +307,8 @@ func TestNoCachingAcrossSyncStateChange(t *testing.T) {
 	// A cache would have to be invalidated on reorg and on sync-state changes.
 	// There is none, so a root that stops being synced must stop yielding an
 	// anchor immediately.
-	root := &fakeRoot{synced: "true", ds: []dns.RR{dsRecord("pirate", 34383)}}
+	initialDS := []dns.RR{dsRecord("pirate", 34383)}
+	root := &fakeRoot{synced: "true", ds: initialDS}
 	addr := startRoot(t, root)
 	p := provider(t, addr)
 
@@ -299,13 +316,12 @@ func TestNoCachingAcrossSyncStateChange(t *testing.T) {
 		t.Fatalf("first Anchor: %v", err)
 	}
 
-	root.synced = "false"
+	root.setState("false", initialDS)
 	if _, err := p.Anchor(context.Background(), "pirate."); !errors.Is(err, ErrNotSynced) {
 		t.Fatalf("anchor served from cache after sync state changed, got %v", err)
 	}
 
-	root.synced = "true"
-	root.ds = nil
+	root.setState("true", nil)
 	if _, err := p.Anchor(context.Background(), "pirate."); !errors.Is(err, vdoh.ErrInsecure) {
 		t.Fatalf("anchor served from cache after the chain no longer publishes a DS, got %v", err)
 	}

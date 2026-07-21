@@ -918,6 +918,32 @@ func TestRejectsNSEC3ProofWithInconsistentParameters(t *testing.T) {
 	}
 }
 
+func TestRejectsNSEC3ProofWithoutAnchoredClosestEncloser(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	name := "handle.pirate"
+	a, aSig := validWildcardAnswer(t, z, now, name)
+	covering := nsec3For("other.pirate", "pirate", "aabb", 1, 0, "")
+	coveringSig := z.sign(t, []dns.RR{covering}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	keySig := z.sign(t, []dns.RR{z.key}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv, _ := newEndpoint(t, func(q dns.Question, req *dns.Msg) *dns.Msg {
+		if q.Qtype == dns.TypeDNSKEY {
+			return reply(req, dns.RcodeSuccess, z.key, keySig)
+		}
+		if q.Qtype == dns.TypeNSEC {
+			m := reply(req, dns.RcodeSuccess)
+			m.Ns = []dns.RR{covering, coveringSig}
+			return m
+		}
+		return reply(req, dns.RcodeSuccess, a, aSig)
+	})
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", name)
+	if err == nil || !strings.Contains(err.Error(), "no validated NSEC/NSEC3 proof") {
+		t.Fatalf("missing anchored closest encloser was accepted or rejected for the wrong reason: %v", err)
+	}
+}
+
 func TestRejectsUnsignedNSEC3CoveringProof(t *testing.T) {
 	z := newZone(t, "pirate")
 	now := time.Unix(1_800_000_000, 0)

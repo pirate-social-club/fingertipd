@@ -618,7 +618,7 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 			// A negative answer needs NSEC/NSEC3 proof to be trustworthy. That is
 			// not implemented, so it is reported as unvalidatable rather than
 			// returned as a proven absence.
-			return nil, fmt.Errorf("%w: negative answer for %s is not proven (NSEC validation unimplemented)", ErrInsecure, current)
+			return nil, fmt.Errorf("%w: negative answer for %s is not proven (general authenticated denial is unimplemented)", ErrInsecure, current)
 		default:
 			return nil, fmt.Errorf("vdoh: lookup for %s failed with rcode %s", current, dns.RcodeToString[msg.Rcode])
 		}

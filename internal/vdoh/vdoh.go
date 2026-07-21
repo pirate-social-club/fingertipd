@@ -4,11 +4,12 @@
 // SCOPE, deliberately narrow: this is NOT full DNSSEC validation. It proves one
 // thing well -- that an RRset was signed by a key the Handshake chain's DS
 // anchor commits to, for a zone anchored at the top level. It does not walk a
-// delegation chain. Its only authenticated-denial support is the plain-NSEC
-// proof for answers synthesized from *.<anchored-zone>, using signed NSEC or
-// conservative NSEC3 without opt-out; general negative answers and wildcards
-// below another closest encloser are refused, not approximated. Do not describe
-// this as "DNSSEC validation" in configuration, docs or release notes.
+// delegation chain. Its authenticated-denial support covers exact NODATA,
+// NXDOMAIN, and positive answers synthesized from *.<anchored-zone>, using
+// signed NSEC or conservative NSEC3 without opt-out. Wildcard-derived NODATA
+// and wildcards below another closest encloser are refused, not approximated.
+// Do not describe this as "DNSSEC validation" in configuration, docs or release
+// notes.
 //
 // It exists because letsdane's own stub resolver cannot safely be pointed at a
 // remote DoH endpoint:
@@ -62,6 +63,13 @@ const maxResponseBytes = 64 << 10
 // ErrInsecure is returned when an answer cannot be proven with the local chain.
 // Callers must treat it as fatal: there is no "use it anyway" path.
 var ErrInsecure = errors.New("vdoh: answer could not be validated")
+
+// ErrProvenAbsent means the zone cryptographically proved that the queried
+// name or type does not exist. It remains an error deliberately: letsdane
+// treats an empty successful TLSA result as permission to create a plain,
+// unvalidated tunnel. Callers must never translate this into (empty, true,
+// nil), especially for TLSA.
+var ErrProvenAbsent = errors.New("vdoh: authenticated DNS absence")
 
 // AnchorFunc returns the DS records for a zone as published on the Handshake
 // chain, obtained locally (hnsd). This is the trust anchor; it must never come
@@ -506,6 +514,80 @@ func (r *Resolver) verifySigsWithWildcard(records []dns.RR, sigs []*dns.RRSIG, z
 	return lastErr
 }
 
+func bitmapHas(bitmap []uint16, qtype uint16) bool {
+	for _, present := range bitmap {
+		if present == qtype {
+			return true
+		}
+	}
+	return false
+}
+
+// validatedDenials extracts only denial records whose complete RRset verifies
+// under the anchored zone keys. The endpoint controls section contents and type
+// bitmaps, so no NSEC/NSEC3 is consulted before its signature and shape pass.
+func (r *Resolver) validatedDenials(msg *dns.Msg, zone string, keys map[uint16]*dns.DNSKEY) ([]*dns.NSEC, []*dns.NSEC3) {
+	var nsecs []*dns.NSEC
+	var nsec3s []*dns.NSEC3
+	for _, section := range [][]dns.RR{msg.Answer, msg.Ns} {
+		seen := make(map[string]bool)
+		for _, candidate := range section {
+			qtype := candidate.Header().Rrtype
+			if qtype != dns.TypeNSEC && qtype != dns.TypeNSEC3 {
+				continue
+			}
+			owner := strings.ToLower(dns.Fqdn(candidate.Header().Name))
+			key := fmt.Sprintf("%d/%s", qtype, owner)
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			records, sigs := rrsetIn(section, candidate.Header().Name, qtype)
+			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
+				continue
+			}
+			for _, record := range records {
+				switch proof := record.(type) {
+				case *dns.NSEC:
+					if proof.Hdr.Class == dns.ClassINET && dns.IsSubDomain(zone, proof.Hdr.Name) && dns.IsSubDomain(zone, proof.NextDomain) {
+						nsecs = append(nsecs, proof)
+					}
+				case *dns.NSEC3:
+					if validNSEC3Shape(proof, zone) {
+						nsec3s = append(nsec3s, proof)
+					}
+				}
+			}
+		}
+	}
+	return nsecs, nsec3s
+}
+
+func ancestorNames(name, zone string) []string {
+	nameLabels := dns.SplitDomainName(dns.Fqdn(name))
+	zoneLabels := dns.SplitDomainName(dns.Fqdn(zone))
+	if len(nameLabels) < len(zoneLabels) {
+		return nil
+	}
+	var out []string
+	for start := 0; start <= len(nameLabels)-len(zoneLabels); start++ {
+		candidate := dns.Fqdn(strings.Join(nameLabels[start:], "."))
+		if dns.IsSubDomain(zone, candidate) {
+			out = append(out, candidate)
+		}
+	}
+	return out
+}
+
+func nextCloser(name, closest string) (string, bool) {
+	nameLabels := dns.SplitDomainName(dns.Fqdn(name))
+	closestLabels := dns.SplitDomainName(dns.Fqdn(closest))
+	if len(nameLabels) <= len(closestLabels) {
+		return "", false
+	}
+	return dns.Fqdn(strings.Join(nameLabels[len(nameLabels)-len(closestLabels)-1:], ".")), true
+}
+
 // proveAnchoredWildcard validates the NSEC proof for an answer whose RRSIG says
 // its source is *.<anchored-zone>. The anchored zone's existence is already
 // established by its DS/DNSKEY chain. RFC 4035 then requires authenticated
@@ -528,20 +610,9 @@ func (r *Resolver) proveAnchoredWildcard(ctx context.Context, name, zone string,
 		return fmt.Errorf("%w: NSEC proof lookup for %s returned %s", ErrInsecure, name, dns.RcodeToString[msg.Rcode])
 	}
 
-	sections := [][]dns.RR{msg.Answer, msg.Ns}
-	for _, section := range sections {
-		for _, candidate := range section {
-			nsec, ok := candidate.(*dns.NSEC)
-			if !ok || !nsecCovers(nsec, nextCloser) {
-				continue
-			}
-			if nsec.Hdr.Class != dns.ClassINET || !dns.IsSubDomain(zone, nsec.Hdr.Name) || !dns.IsSubDomain(zone, nsec.NextDomain) {
-				continue
-			}
-			records, sigs := rrsetIn(section, nsec.Hdr.Name, dns.TypeNSEC)
-			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
-				continue
-			}
+	nsecs, nsec3s := r.validatedDenials(msg, zone, keys)
+	for _, nsec := range nsecs {
+		if nsecCovers(nsec, nextCloser) {
 			return nil
 		}
 	}
@@ -551,41 +622,106 @@ func (r *Resolver) proveAnchoredWildcard(ctx context.Context, name, zone string,
 	// and another with identical parameters must cover the next-closer name.
 	// Opt-out is rejected above because it can cover an insecure delegation and
 	// is not sufficient evidence that the wildcard applies.
-	var validated []*dns.NSEC3
-	for _, section := range sections {
-		seen := make(map[string]bool)
-		for _, candidate := range section {
-			nsec3, ok := candidate.(*dns.NSEC3)
-			if !ok || !validNSEC3Shape(nsec3, zone) {
-				continue
-			}
-			owner := strings.ToLower(dns.Fqdn(nsec3.Hdr.Name))
-			if seen[owner] {
-				continue
-			}
-			seen[owner] = true
-			records, sigs := rrsetIn(section, nsec3.Hdr.Name, dns.TypeNSEC3)
-			if err := r.verifySigs(records, sigs, zone, keys); err != nil {
-				continue
-			}
-			for _, record := range records {
-				if proof, ok := record.(*dns.NSEC3); ok && validNSEC3Shape(proof, zone) {
-					validated = append(validated, proof)
-				}
-			}
-		}
-	}
-	for _, closest := range validated {
+	for _, closest := range nsec3s {
 		if !closest.Match(zone) {
 			continue
 		}
-		for _, covering := range validated {
+		for _, covering := range nsec3s {
 			if sameNSEC3Params(closest, covering) && covering.Cover(nextCloser) {
 				return nil
 			}
 		}
 	}
 	return fmt.Errorf("%w: no validated NSEC/NSEC3 proof covers next-closer %s", ErrInsecure, nextCloser)
+}
+
+func (r *Resolver) proveNODATA(msg *dns.Msg, name string, qtype uint16, zone string, keys map[uint16]*dns.DNSKEY) error {
+	nsecs, nsec3s := r.validatedDenials(msg, zone, keys)
+	for _, proof := range nsecs {
+		if strings.EqualFold(dns.Fqdn(proof.Hdr.Name), dns.Fqdn(name)) &&
+			!bitmapHas(proof.TypeBitMap, qtype) && !bitmapHas(proof.TypeBitMap, dns.TypeCNAME) {
+			return nil
+		}
+	}
+	for _, proof := range nsec3s {
+		if proof.Match(name) && !bitmapHas(proof.TypeBitMap, qtype) && !bitmapHas(proof.TypeBitMap, dns.TypeCNAME) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: no validated denial proves type %s absent at %s", ErrInsecure, dns.TypeToString[qtype], name)
+}
+
+func nsecSetCovers(proofs []*dns.NSEC, name string) bool {
+	for _, proof := range proofs {
+		if nsecCovers(proof, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func nsec3SetCovers(proofs []*dns.NSEC3, params *dns.NSEC3, name string) bool {
+	for _, proof := range proofs {
+		if sameNSEC3Params(params, proof) && proof.Cover(name) {
+			return true
+		}
+	}
+	return false
+}
+
+func (r *Resolver) proveNXDOMAIN(msg *dns.Msg, name, zone string, keys map[uint16]*dns.DNSKEY) error {
+	nsecs, nsec3s := r.validatedDenials(msg, zone, keys)
+	ancestors := ancestorNames(name, zone)
+	if len(ancestors) < 2 { // the queried name must be below the anchored zone
+		return fmt.Errorf("%w: cannot derive a closest encloser for %s", ErrInsecure, name)
+	}
+
+	// Plain NSEC: the anchored zone is known to exist. A longer closest encloser
+	// is accepted only when an exact, signed NSEC owner proves that ancestor
+	// exists. The next-closer and corresponding wildcard must both be denied.
+	closest := dns.Fqdn(zone)
+	for _, ancestor := range ancestors[1 : len(ancestors)-1] {
+		found := false
+		for _, proof := range nsecs {
+			if strings.EqualFold(dns.Fqdn(proof.Hdr.Name), ancestor) {
+				closest, found = ancestor, true
+				break
+			}
+		}
+		if found {
+			break
+		}
+	}
+	if next, ok := nextCloser(name, closest); ok {
+		wildcard := "*." + dns.Fqdn(closest)
+		if nsecSetCovers(nsecs, next) && nsecSetCovers(nsecs, wildcard) {
+			return nil
+		}
+	}
+
+	// NSEC3: a matching hash proves the closest encloser exists. Covering proofs
+	// for next-closer and wildcard must use identical hash parameters.
+	for _, matching := range nsec3s {
+		var closest string
+		for _, ancestor := range ancestors[1:] {
+			if matching.Match(ancestor) {
+				closest = ancestor
+				break
+			}
+		}
+		if closest == "" {
+			continue
+		}
+		next, ok := nextCloser(name, closest)
+		if !ok {
+			continue
+		}
+		wildcard := "*." + dns.Fqdn(closest)
+		if nsec3SetCovers(nsec3s, matching, next) && nsec3SetCovers(nsec3s, matching, wildcard) {
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: no validated denial proves NXDOMAIN for %s", ErrInsecure, name)
 }
 
 // maxCNAMEDepth bounds an alias chain. A loop or an absurdly long chain from an
@@ -615,10 +751,10 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 		switch msg.Rcode {
 		case dns.RcodeSuccess:
 		case dns.RcodeNameError:
-			// A negative answer needs NSEC/NSEC3 proof to be trustworthy. That is
-			// not implemented, so it is reported as unvalidatable rather than
-			// returned as a proven absence.
-			return nil, fmt.Errorf("%w: negative answer for %s is not proven (general authenticated denial is unimplemented)", ErrInsecure, current)
+			if err := r.proveNXDOMAIN(msg, current, zone, keys); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: name %s does not exist", ErrProvenAbsent, current)
 		default:
 			return nil, fmt.Errorf("vdoh: lookup for %s failed with rcode %s", current, dns.RcodeToString[msg.Rcode])
 		}
@@ -644,7 +780,10 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 
 		aliases, aliasSigs := rrset(msg, current, dns.TypeCNAME)
 		if len(aliases) == 0 {
-			return nil, fmt.Errorf("%w: no records of the requested type for %s", ErrInsecure, current)
+			if err := r.proveNODATA(msg, current, qtype, zone, keys); err != nil {
+				return nil, err
+			}
+			return nil, fmt.Errorf("%w: %s has no %s record", ErrProvenAbsent, current, dns.TypeToString[qtype])
 		}
 		if len(aliases) > 1 {
 			// A name owns at most one CNAME. More than one means the endpoint is

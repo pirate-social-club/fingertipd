@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -634,5 +635,46 @@ func TestExactAnswerStillAcceptedAlongsideWildcardRule(t *testing.T) {
 
 	if _, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "app.pirate"); err != nil || !secure {
 		t.Fatalf("exact answer rejected: %v %v", secure, err)
+	}
+}
+
+// chainZone builds n aliases c0 -> c1 -> ... -> cn, with cn holding the address.
+// n is therefore the exact number of aliases that must be followed.
+func chainZone(t *testing.T, z *zone, now time.Time, n int) handler {
+	t.Helper()
+	var rrs []dns.RR
+	for i := 0; i < n; i++ {
+		rrs = append(rrs, cname(fmt.Sprintf("c%d.pirate", i), fmt.Sprintf("c%d.pirate", i+1)))
+	}
+	rrs = append(rrs, aRecord(fmt.Sprintf("c%d.pirate", n), "94.103.168.161"))
+	return signedZone(t, z, now, rrs...)
+}
+
+func TestFollowsExactlyMaxCNAMEDepth(t *testing.T) {
+	// The bound must name the number of aliases actually permitted.
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, chainZone(t, z, now, maxCNAMEDepth))
+
+	ips, secure, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "c0.pirate")
+	if err != nil || !secure {
+		t.Fatalf("a chain of exactly %d aliases was rejected: %v %v", maxCNAMEDepth, secure, err)
+	}
+	if len(ips) != 1 || ips[0].String() != "94.103.168.161" {
+		t.Fatalf("got %v", ips)
+	}
+}
+
+func TestRejectsOneMoreThanMaxCNAMEDepth(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	srv, _ := newEndpoint(t, chainZone(t, z, now, maxCNAMEDepth+1))
+
+	_, _, err := testResolver(t, srv.URL, z).LookupIP(context.Background(), "ip4", "c0.pirate")
+	if err == nil {
+		t.Fatalf("followed %d aliases despite a stated bound of %d", maxCNAMEDepth+1, maxCNAMEDepth)
+	}
+	if !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("rejected for the wrong reason: %v", err)
 	}
 }

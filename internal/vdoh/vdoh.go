@@ -410,11 +410,8 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 	}
 
 	current := dns.Fqdn(name)
-	for depth := 0; ; depth++ {
-		if depth > maxCNAMEDepth {
-			return nil, fmt.Errorf("%w: alias chain from %s exceeded %d steps", ErrInsecure, name, maxCNAMEDepth)
-		}
-
+	followed := 0
+	for {
 		msg, err := r.exchange(ctx, current, qtype)
 		if err != nil {
 			return nil, err
@@ -464,6 +461,13 @@ func (r *Resolver) lookup(ctx context.Context, name string, qtype uint16) ([]dns
 		if strings.EqualFold(target, current) {
 			return nil, fmt.Errorf("%w: CNAME for %s points to itself", ErrInsecure, current)
 		}
+		// Enforced here, at the point of following, so the bound is exactly the
+		// number of aliases traversed. Checking at the top of the loop instead
+		// permits one more hop than the limit names.
+		if followed >= maxCNAMEDepth {
+			return nil, fmt.Errorf("%w: alias chain from %s exceeded %d steps", ErrInsecure, name, maxCNAMEDepth)
+		}
+		followed++
 		current = target
 	}
 }

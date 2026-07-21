@@ -856,6 +856,21 @@ func TestRejectsNSEC3NODATABitmapClaimingTLSAExists(t *testing.T) {
 	}
 }
 
+func TestRejectsNSEC3NODATABitmapClaimingCNAMEExists(t *testing.T) {
+	z := newZone(t, "pirate")
+	now := time.Unix(1_800_000_000, 0)
+	qname := "_443._tcp.app.pirate"
+	proof := nsec3For(qname, "pirate", "aabb", 1, 0, "")
+	proof.TypeBitMap = []uint16{dns.TypeCNAME, dns.TypeRRSIG}
+	proofSig := z.sign(t, []dns.RR{proof}, now.Add(-time.Hour), now.Add(24*time.Hour))
+	srv := negativeEndpoint(t, z, now, dns.RcodeSuccess, proof, proofSig)
+
+	_, _, err := testResolver(t, srv.URL, z).LookupTLSA(context.Background(), "443", "tcp", "app.pirate")
+	if err == nil || !errors.Is(err, ErrInsecure) || errors.Is(err, ErrProvenAbsent) {
+		t.Fatalf("CNAME-bearing NSEC3 NODATA bitmap accepted or misclassified: %v", err)
+	}
+}
+
 func TestProvesNXDOMAINWithSignedNSEC3ClosestAndCoveringProof(t *testing.T) {
 	z := newZone(t, "pirate")
 	now := time.Unix(1_800_000_000, 0)

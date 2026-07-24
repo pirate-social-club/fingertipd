@@ -1,0 +1,31 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: 1.24.6
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Go
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+          echo "bbca37cc395c974ffa4893ee35819ad23ebb27426df87af92e93a9ec66ef8712  /tmp/go.tar.gz" | sha256sum -c -
+          sudo tar -C /usr/local -xzf /tmp/go.tar.gz
+          echo /usr/local/go/bin >> "$GITHUB_PATH"
+      - name: Test
+        run: go test ./...
+      - name: Build
+        run: go build -buildvcs=false ./...

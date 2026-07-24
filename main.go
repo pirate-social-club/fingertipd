@@ -197,12 +197,7 @@ func run(cfg config, stdout *os.File) error {
 	if err != nil {
 		return fmt.Errorf("compose resolver: %w", err)
 	}
-	handler, err := (&letsdane.Config{
-		Certificate: ca,
-		PrivateKey:  key,
-		Validity:    24 * time.Hour,
-		Resolver:    resolver,
-	}).NewHandler()
+	handler, err := newLetsDANEConfig(ca, key, resolver).NewHandler()
 	if err != nil {
 		return fmt.Errorf("create proxy: %w", err)
 	}
@@ -236,6 +231,20 @@ func run(cfg config, stdout *os.File) error {
 			return nil
 		}
 		return fmt.Errorf("proxy exited: %w", err)
+	}
+}
+
+func newLetsDANEConfig(ca *x509.Certificate, key *rsa.PrivateKey, resolver letsresolver.Resolver) *letsdane.Config {
+	return &letsdane.Config{
+		Certificate: ca,
+		PrivateKey:  key,
+		Validity:    24 * time.Hour,
+		Resolver:    resolver,
+		// RFC 7671 section 5.1 binds a DANE-EE server identity through
+		// its DNSSEC-authenticated TLSA association. Certificate name
+		// checks do not apply and would reject legitimate shared DANE
+		// gateways whose leaf certificate intentionally has no SAN.
+		SkipNameChecks: true,
 	}
 }
 

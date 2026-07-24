@@ -22,6 +22,13 @@ func TestParseConfig(t *testing.T) {
 	}
 }
 
+func TestLetsDANEConfigDisablesDANEEENameChecks(t *testing.T) {
+	cfg := newLetsDANEConfig(nil, nil, nil)
+	if !cfg.SkipNameChecks {
+		t.Fatal("DANE-EE must authenticate through the TLSA association without certificate name checks")
+	}
+}
+
 func TestQuerySyncUsesRootForHeightAndRecursiveForReadiness(t *testing.T) {
 	rootAddr := startDNSTestServer(t, dns.HandlerFunc(func(w dns.ResponseWriter, request *dns.Msg) {
 		if request.Question[0].Qclass != dns.ClassHESIOD {

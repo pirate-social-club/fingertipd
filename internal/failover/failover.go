@@ -15,6 +15,7 @@ import (
 	"net"
 
 	"github.com/miekg/dns"
+	"github.com/pirate-social-club/fingertipd/internal/strictaddr"
 )
 
 // Resolver is the subset of letsdane's resolver.Resolver that this package
@@ -51,6 +52,9 @@ func New(primary, fallback Resolver, logf Logf) (Resolver, error) {
 
 func (r *resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, bool, error) {
 	ips, secure, err := r.primary.LookupIP(ctx, network, host)
+	if errors.Is(err, strictaddr.ErrAddressValidation) {
+		return nil, false, err
+	}
 	// Only a failure to answer sends us to the fallback. A primary that answered
 	// is authoritative for this lookup, including when it answered insecurely:
 	// re-asking elsewhere on an insecure answer would let anyone who can degrade

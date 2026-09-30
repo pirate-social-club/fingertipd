@@ -23,6 +23,22 @@ Hermetic tests may pass `-hnsd-seed 127.0.0.1:<port>` to connect the spawned
 compile-time-regtest hnsd to their local hsd fixture. The flag is optional,
 accepts loopback addresses only, and is omitted by every production launch.
 
+## Address validation
+
+The HNS sidecar requires authenticated responses for every requested address
+family before opening an upstream connection. An authenticated empty AAAA
+answer is acceptable alongside an authenticated A address. A failed or
+unauthenticated answer in either family rejects the entire lookup, regardless
+of completion order. Authenticated absence in every family is also rejected.
+The loopback hnsd stub supplies the authentication result; the helper does not
+trust an external resolver's AD flag.
+
+Address failures are terminal, including DNS errors whose validation status
+cannot be distinguished. They cannot trigger the optional DoH failover. This
+conservative rule adds address authentication to the existing TLSA/DANE check;
+it does not enable DoH or change certificate validation. Ordinary browser HTTPS
+uses its normal route rather than this HNS resolver.
+
 ## Pinned dependencies
 
 - `buffrr/letsdane` v0.6.1

@@ -29,6 +29,7 @@ import (
 	"github.com/pirate-social-club/fingertipd/internal/failover"
 	"github.com/pirate-social-club/fingertipd/internal/hnsanchor"
 	"github.com/pirate-social-club/fingertipd/internal/netutil"
+	"github.com/pirate-social-club/fingertipd/internal/strictaddr"
 	"github.com/pirate-social-club/fingertipd/internal/vdoh"
 )
 
@@ -193,7 +194,11 @@ func run(cfg config, stdout *os.File) error {
 		log.Printf("validated DoH fallback enabled: %s (anchored on %s)", cfg.dohEndpoint, cfg.rootAddr)
 	}
 
-	resolver, err := failover.New(localResolver, dohFallback, log.Printf)
+	strictLocal, err := strictaddr.New(localResolver.Query)
+	if err != nil {
+		return fmt.Errorf("create strict address resolver: %w", err)
+	}
+	resolver, err := failover.New(strictLocal, dohFallback, log.Printf)
 	if err != nil {
 		return fmt.Errorf("compose resolver: %w", err)
 	}

@@ -14,7 +14,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -57,7 +59,7 @@ func TestProxyRequiresAuthenticatedAddressesBeforeConnecting(t *testing.T) {
 	roots := x509.NewCertPool()
 	roots.AddCert(ca)
 
-	for _, mode := range []string{"valid", "A-insecure", "AAAA-insecure", "A-servfail", "AAAA-servfail", "wrong-dane", "missing-tlsa", "insecure-tlsa"} {
+	for _, mode := range []string{"valid", "A-insecure", "AAAA-insecure", "A-servfail", "AAAA-servfail", "wrong-dane", "missing-tlsa", "insecure-tlsa", "http-valid", "http-insecure", "network-refused", "network-timeout"} {
 		t.Run(mode, func(t *testing.T) {
 			var requests atomic.Int64
 			upstream := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -66,18 +68,33 @@ func TestProxyRequiresAuthenticatedAddressesBeforeConnecting(t *testing.T) {
 			}))
 			listener := &countingListener{Listener: upstream.Listener}
 			upstream.Listener = listener
-			upstream.StartTLS()
+			plainHTTP := strings.HasPrefix(mode, "http-")
+			if plainHTTP {
+				upstream.Start()
+			} else {
+				upstream.StartTLS()
+			}
 			defer upstream.Close()
-			pin := sha256.Sum256(upstream.Certificate().RawSubjectPublicKeyInfo)
+			var pin [32]byte
+			if !plainHTTP {
+				pin = sha256.Sum256(upstream.Certificate().RawSubjectPublicKeyInfo)
+			}
 			if mode == "wrong-dane" {
 				pin[0] ^= 1
 			}
 			query := func(ctx context.Context, host string, qtype uint16) *letsresolver.DNSResult {
 				result := &letsresolver.DNSResult{Secure: true}
+				if (mode == "network-refused" || mode == "network-timeout") && (qtype == dns.TypeA || qtype == dns.TypeAAAA) {
+					err := syscall.ECONNREFUSED
+					if mode == "network-timeout" {
+						err = syscall.ETIMEDOUT
+					}
+					return &letsresolver.DNSResult{Err: &net.OpError{Op: "read", Net: "udp", Err: err}}
+				}
 				switch qtype {
 				case dns.TypeA:
 					result.Records = []dns.RR{&dns.A{A: net.ParseIP("127.0.0.1")}}
-					if mode == "A-insecure" {
+					if mode == "A-insecure" || mode == "http-insecure" {
 						result.Secure = false
 					}
 					if mode == "A-servfail" {
@@ -112,7 +129,10 @@ func TestProxyRequiresAuthenticatedAddressesBeforeConnecting(t *testing.T) {
 			var fallbackCalls atomic.Int64
 			fallback, err := strictaddr.New(func(ctx context.Context, host string, qtype uint16) *letsresolver.DNSResult {
 				fallbackCalls.Add(1)
-				return &letsresolver.DNSResult{Secure: true, Records: []dns.RR{&dns.A{A: net.ParseIP("127.0.0.1")}}}
+				if qtype == dns.TypeA {
+					return &letsresolver.DNSResult{Secure: true, Records: []dns.RR{&dns.A{A: net.ParseIP("127.0.0.1")}}}
+				}
+				return &letsresolver.DNSResult{Secure: true}
 			})
 			if err != nil {
 				t.Fatal(err)
@@ -138,11 +158,15 @@ func TestProxyRequiresAuthenticatedAddressesBeforeConnecting(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			response, requestErr := client.Get("https://test.hns:" + port + "/")
+			scheme := "https"
+			if plainHTTP {
+				scheme = "http"
+			}
+			response, requestErr := client.Get(scheme + "://test.hns:" + port + "/")
 			if response != nil {
 				defer response.Body.Close()
 			}
-			if mode == "valid" {
+			if mode == "valid" || mode == "http-valid" || mode == "network-refused" || mode == "network-timeout" {
 				if requestErr != nil {
 					t.Fatal(requestErr)
 				}
@@ -150,12 +174,16 @@ func TestProxyRequiresAuthenticatedAddressesBeforeConnecting(t *testing.T) {
 				if err != nil || response.StatusCode != 200 || string(body) != "authenticated gateway" || requests.Load() != 1 {
 					t.Fatalf("valid DANE control failed: status=%d body=%q requests=%d err=%v", response.StatusCode, body, requests.Load(), err)
 				}
+				if strings.HasPrefix(mode, "network-") && fallbackCalls.Load() != 2 {
+					t.Fatalf("transport failure did not use both validated fallback families: %d", fallbackCalls.Load())
+				}
 				return
 			}
-			if requestErr == nil || requests.Load() != 0 {
+			httpRefusal := plainHTTP && response != nil && response.StatusCode >= 400
+			if (requestErr == nil && !httpRefusal) || requests.Load() != 0 {
 				t.Fatalf("negative reached application: error=%v requests=%d", requestErr, requests.Load())
 			}
-			if mode == "A-insecure" || mode == "AAAA-insecure" || mode == "A-servfail" || mode == "AAAA-servfail" {
+			if mode == "A-insecure" || mode == "AAAA-insecure" || mode == "A-servfail" || mode == "AAAA-servfail" || mode == "http-insecure" {
 				if listener.connections.Load() != 0 || fallbackCalls.Load() != 0 {
 					t.Fatalf("address refusal opened a connection: upstream=%d fallback=%d", listener.connections.Load(), fallbackCalls.Load())
 				}

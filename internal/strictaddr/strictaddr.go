@@ -13,8 +13,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-// ErrAddressValidation is terminal, including when an underlying DNS error is
-// ambiguous about validation. An alternate resolver must not route around it.
+// ErrAddressValidation is terminal. DNS errors ambiguous about validation, such
+// as SERVFAIL, are not transport errors and cannot trigger another resolver.
 var ErrAddressValidation = errors.New("HNS address validation failed")
 
 type Query func(context.Context, string, uint16) *letsresolver.DNSResult
@@ -61,17 +61,26 @@ func (r *Resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP
 		}(qtype)
 	}
 	var ips []net.IP
+	var transportErr error
 	for range qtypes {
 		var a answer
 		select {
 		case <-ctx.Done():
-			return nil, false, fmt.Errorf("%w: %w", ErrAddressValidation, ctx.Err())
+			return nil, false, ctx.Err()
 		case a = <-answers:
 		}
 		if a.result == nil {
 			return nil, false, fmt.Errorf("%w: %s %s returned no result", ErrAddressValidation, host, dns.TypeToString[a.qtype])
 		}
 		if a.result.Err != nil {
+			var socketErr *net.OpError
+			if errors.As(a.result.Err, &socketErr) {
+				// A refused socket or I/O timeout may use the explicitly
+				// configured validating fallback. Wait for the other family:
+				// a validation failure must win even if transport failed first.
+				transportErr = fmt.Errorf("HNS address transport failure: %w", a.result.Err)
+				continue
+			}
 			return nil, false, fmt.Errorf("%w: %s %s: %w", ErrAddressValidation, host, dns.TypeToString[a.qtype], a.result.Err)
 		}
 		if !a.result.Secure {
@@ -92,6 +101,9 @@ func (r *Resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP
 				}
 			}
 		}
+	}
+	if transportErr != nil {
+		return nil, false, transportErr
 	}
 	if len(ips) == 0 {
 		return nil, false, fmt.Errorf("%w: %s has no authenticated address", ErrAddressValidation, host)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"syscall"
 	"testing"
 	"time"
 
@@ -22,12 +23,12 @@ func addressResult(qtype uint16) *letsresolver.DNSResult {
 func TestEveryFamilyMustValidateInEitherOrder(t *testing.T) {
 	for _, badType := range []uint16{dns.TypeA, dns.TypeAAAA} {
 		for _, badFirst := range []bool{true, false} {
-			for _, failure := range []string{"insecure-data", "servfail"} {
+			for _, failure := range []string{"insecure-data", "servfail", "transport-mixed"} {
 				name := dns.TypeToString[badType] + "/" + failure
 				if badFirst {
 					name += "/failure-first"
 				} else {
-					name += "/success-first"
+					name += "/other-family-first"
 				}
 				t.Run(name, func(t *testing.T) {
 					release := map[uint16]chan struct{}{dns.TypeA: make(chan struct{}), dns.TypeAAAA: make(chan struct{})}
@@ -40,6 +41,9 @@ func TestEveryFamilyMustValidateInEitherOrder(t *testing.T) {
 						case <-release[qtype]:
 						}
 						if qtype != badType {
+							if failure == "transport-mixed" {
+								return &letsresolver.DNSResult{Err: &net.OpError{Op: "read", Net: "udp", Err: syscall.ECONNREFUSED}}
+							}
 							// Signed absence of the other family must not hide a failure.
 							return &letsresolver.DNSResult{Secure: true}
 						}

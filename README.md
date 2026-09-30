@@ -33,11 +33,21 @@ of completion order. Authenticated absence in every family is also rejected.
 The loopback hnsd stub supplies the authentication result; the helper does not
 trust an external resolver's AD flag.
 
-Address failures are terminal, including DNS errors whose validation status
-cannot be distinguished. They cannot trigger the optional DoH failover. This
-conservative rule adds address authentication to the existing TLSA/DANE check;
-it does not enable DoH or change certificate validation. Ordinary browser HTTPS
-uses its normal route rather than this HNS resolver.
+DNSSEC is required for every HNS navigation, including plain HTTP. Unsigned
+HNS zones are not supported. HTTPS additionally retains its validated DANE
+requirement. This is the workspace_owner's explicit policy decision of
+2026-09-30; ordinary browser HTTPS uses its normal route.
+
+Failed validation, unvalidated answers and DNS errors such as SERVFAIL whose
+validation status cannot be distinguished are terminal. Socket-level timeouts
+and refused connections remain eligible for the explicitly configured
+validating DoH fallback. Both local address families are checked before a
+transport failure can retry elsewhere, so a validation failure in the other
+family cannot be hidden. Caller cancellation does not retry. The fallback also
+requires every family to validate or prove absence, and its returned addresses
+must be authenticated. This does not activate DoH or implement delegated-zone
+validation; the optional fallback remains off by default and limited to its
+existing controlled top-level validation scope.
 
 ## Pinned dependencies
 

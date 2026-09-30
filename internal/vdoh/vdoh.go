@@ -849,6 +849,11 @@ func (r *Resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP
 	for _, qtype := range qtypes {
 		records, err := r.lookup(ctx, host, qtype)
 		if err != nil {
+			// Only authenticated absence is compatible with addresses from
+			// the other family. Never hide its failed validation or transport.
+			if !errors.Is(err, ErrProvenAbsent) {
+				return nil, false, err
+			}
 			lastErr = err
 			continue
 		}

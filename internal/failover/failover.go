@@ -15,6 +15,7 @@ import (
 	"net"
 
 	"github.com/miekg/dns"
+	"github.com/pirate-social-club/fingertipd/internal/strictaddr"
 )
 
 // Resolver is the subset of letsdane's resolver.Resolver that this package
@@ -36,9 +37,9 @@ type resolver struct {
 
 // New returns a Resolver that consults primary first.
 //
-// fallback may be nil, in which case this is exactly primary. Both results and
-// errors from the fallback are returned unchanged: it is expected to validate
-// for itself and to fail closed, and this package never relaxes that.
+// fallback may be nil, in which case this is exactly primary. The fallback must validate
+// for itself; LookupIP additionally rejects an insecure or empty success.
+// Fallback errors remain refusals, never usable addresses.
 func New(primary, fallback Resolver, logf Logf) (Resolver, error) {
 	if primary == nil {
 		return nil, errors.New("failover: primary resolver is required")
@@ -50,7 +51,16 @@ func New(primary, fallback Resolver, logf Logf) (Resolver, error) {
 }
 
 func (r *resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, false, err
+	}
 	ips, secure, err := r.primary.LookupIP(ctx, network, host)
+	if ctx.Err() != nil {
+		return nil, false, ctx.Err()
+	}
+	if errors.Is(err, strictaddr.ErrAddressValidation) {
+		return nil, false, err
+	}
 	// Only a failure to answer sends us to the fallback. A primary that answered
 	// is authoritative for this lookup, including when it answered insecurely:
 	// re-asking elsewhere on an insecure answer would let anyone who can degrade
@@ -62,7 +72,14 @@ func (r *resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP
 		return ips, secure, err
 	}
 	r.logf("local resolver could not answer %s (%v); trying validated fallback", host, err)
-	return r.fallback.LookupIP(ctx, network, host)
+	ips, secure, err = r.fallback.LookupIP(ctx, network, host)
+	if err != nil {
+		return nil, false, err
+	}
+	if !secure || len(ips) == 0 {
+		return nil, false, strictaddr.ErrAddressValidation
+	}
+	return ips, true, nil
 }
 
 func (r *resolver) LookupTLSA(ctx context.Context, service, proto, name string) ([]*dns.TLSA, bool, error) {

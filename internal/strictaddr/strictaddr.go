@@ -1,0 +1,118 @@
+// Package strictaddr requires authenticated results for every requested address
+// family before letsdane can use any address. The helper is an HNS sidecar;
+// ordinary browser HTTPS does not use this resolver.
+package strictaddr
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net"
+
+	letsresolver "github.com/buffrr/letsdane/resolver"
+	"github.com/miekg/dns"
+)
+
+// ErrAddressValidation is terminal. DNS errors ambiguous about validation, such
+// as SERVFAIL, are not transport errors and cannot trigger another resolver.
+var ErrAddressValidation = errors.New("HNS address validation failed")
+
+type Query func(context.Context, string, uint16) *letsresolver.DNSResult
+
+type Resolver struct {
+	query Query
+	tlsa  letsresolver.DefaultResolver
+}
+
+func New(query Query) (*Resolver, error) {
+	if query == nil {
+		return nil, errors.New("strictaddr: query is required")
+	}
+	return &Resolver{query: query, tlsa: letsresolver.DefaultResolver{Query: query}}, nil
+}
+
+type answer struct {
+	qtype  uint16
+	result *letsresolver.DNSResult
+}
+
+func (r *Resolver) LookupIP(ctx context.Context, network, host string) ([]net.IP, bool, error) {
+	qtypes := []uint16{dns.TypeA, dns.TypeAAAA}
+	switch network {
+	case "ip":
+	case "ip4":
+		qtypes = []uint16{dns.TypeA}
+	case "ip6":
+		qtypes = []uint16{dns.TypeAAAA}
+	default:
+		return nil, false, fmt.Errorf("%w: unsupported network %q", ErrAddressValidation, network)
+	}
+	if host == "" {
+		return nil, false, fmt.Errorf("%w: empty hostname", ErrAddressValidation)
+	}
+
+	lookupCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	// Buffer every result so early refusal cannot leave a sender blocked.
+	answers := make(chan answer, len(qtypes))
+	for _, qtype := range qtypes {
+		go func(qtype uint16) {
+			answers <- answer{qtype, r.query(lookupCtx, host, qtype)}
+		}(qtype)
+	}
+	var ips []net.IP
+	var transportErr error
+	for range qtypes {
+		var a answer
+		select {
+		case <-ctx.Done():
+			return nil, false, ctx.Err()
+		case a = <-answers:
+		}
+		if a.result == nil {
+			return nil, false, fmt.Errorf("%w: %s %s returned no result", ErrAddressValidation, host, dns.TypeToString[a.qtype])
+		}
+		if a.result.Err != nil {
+			var socketErr *net.OpError
+			if errors.As(a.result.Err, &socketErr) {
+				// A refused socket or I/O timeout may use the explicitly
+				// configured validating fallback. Wait for the other family:
+				// a validation failure must win even if transport failed first.
+				transportErr = fmt.Errorf("HNS address transport failure: %w", a.result.Err)
+				continue
+			}
+			return nil, false, fmt.Errorf("%w: %s %s: %w", ErrAddressValidation, host, dns.TypeToString[a.qtype], a.result.Err)
+		}
+		if !a.result.Secure {
+			return nil, false, fmt.Errorf("%w: %s %s is unauthenticated", ErrAddressValidation, host, dns.TypeToString[a.qtype])
+		}
+		// An authenticated empty result represents proven absence for this
+		// family. It must neither invalidate a good other family nor clear an
+		// error from it. Only records of the requested family are usable.
+		for _, rr := range a.result.Records {
+			switch record := rr.(type) {
+			case *dns.A:
+				if a.qtype == dns.TypeA {
+					ips = append(ips, record.A)
+				}
+			case *dns.AAAA:
+				if a.qtype == dns.TypeAAAA {
+					ips = append(ips, record.AAAA)
+				}
+			}
+		}
+	}
+	if transportErr != nil {
+		return nil, false, transportErr
+	}
+	if len(ips) == 0 {
+		return nil, false, fmt.Errorf("%w: %s has no authenticated address", ErrAddressValidation, host)
+	}
+	return ips, true, nil
+}
+
+// Keep letsdane's TLSA security result and error semantics unchanged. Address
+// validation is additional to its existing DANE certificate authentication.
+func (r *Resolver) LookupTLSA(ctx context.Context, service, proto, name string) ([]*dns.TLSA, bool, error) {
+	return r.tlsa.LookupTLSA(ctx, service, proto, name)
+}

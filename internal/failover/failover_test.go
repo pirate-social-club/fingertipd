@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/miekg/dns"
+	"github.com/pirate-social-club/fingertipd/internal/strictaddr"
 )
 
 type stub struct {
@@ -17,6 +18,18 @@ type stub struct {
 	err     error
 	ipCalls int
 	tlCalls int
+}
+
+func TestAddressValidationFailureNeverUsesFallback(t *testing.T) {
+	primary := &stub{err: strictaddr.ErrAddressValidation}
+	fallback := &stub{ips: []net.IP{net.ParseIP("127.0.0.1")}, secure: true}
+	ips, secure, err := mustNew(t, primary, fallback).LookupIP(context.Background(), "ip", "test.hns")
+	if !errors.Is(err, strictaddr.ErrAddressValidation) || len(ips) != 0 || secure {
+		t.Fatalf("validation refusal changed: %v %v %v", ips, secure, err)
+	}
+	if fallback.ipCalls != 0 {
+		t.Fatal("fallback routed around validation failure")
+	}
 }
 
 func (s *stub) LookupIP(ctx context.Context, network, host string) ([]net.IP, bool, error) {
